@@ -329,7 +329,8 @@ void Launcher::draw_settings(Canvas &c)
         break;
     case kDiagnostics:
         about = tr("Setup status and detailed logs.");
-        lines = {{tr("SETUP"), home_.setup_ready ? tr("Ready") : tr("Needs attention")},
+        lines = {{tr("SETUP"), !home_.setup_ready ? tr("Needs attention") :
+                                     home_.keys_ready ? tr("Ready") : tr("Unencrypted games only")},
                  {tr("DETAILED LOGS"), on_off(prefs_.detailed_logging)},
                  {tr("TESTING SWITCHES"), testing_active() == 0 ? std::string{tr("None")} :
                                           fill(tr("{0} on"), {std::to_string(testing_active())})}};

@@ -19,6 +19,10 @@ void TakeBigImageReserve(std::size_t mib) noexcept;
 void* TakeBigImageBlock(std::size_t bytes) noexcept;
 int GiveBigImageBlock(void* address) noexcept;
 bool BigImageRequest(std::size_t bytes) noexcept;
+// The code caches' next step ahead of the need (src/memory_pages.cpp).
+void SetCodeCommitAhead(int mode, unsigned mark_pct, std::size_t room_mib) noexcept;
+// T132's test hook for the code caches (src/memory_pages.cpp).
+void SetCodeCommitRefuse(unsigned long long count, unsigned after_s, unsigned where) noexcept;
 } // namespace Common
 
 namespace {
@@ -67,7 +71,41 @@ extern "C" void eden_heap_set_wait_gpu_ms(unsigned ms) __attribute__((weak));
 //   EDEN_TEST_HEAP_STARVE_GPU=1 (a test, with EDEN_TEST_HEAP_STARVE): the refusals go to the threads
 //     inside such a run-time build instead of the builder threads.
 extern "C" void eden_heap_set_starve_scope(int on) __attribute__((weak));
+//   EDEN_UP_HEAP_STEAL=<1|2|3> (unset or 0: off): a request the heap is about to refuse because it
+//     could not grow is served from an arena no thread is on, empty ones first (1: count only,
+//     2: serve, 3: serve, move the arena to a small request's thread, and ask the idle arenas before
+//     the pool for 1 s after the pool refused a growth) (headless/heap_arenas.inc, eden_heap_steal).
+//     EDEN_UP_HEAP_STEAL_TABLE=1 adds the heap's table at the brink (read in headless/performance.cpp).
+extern "C" void eden_heap_set_steal(int mode) __attribute__((weak));
+//   EDEN_TEST_HEAP_NO_GROW=<every>[,<after_s>] (a test): from <after_s> s on, every <every>-th growth of
+//     the heap is refused as if the pool had no memory (headless/heap_arenas.inc, eden_heap_test_no_grow).
+extern "C" void eden_heap_set_no_grow(unsigned every, unsigned after_s) __attribute__((weak));
 extern "C" void eden_heap_set_large(std::size_t kib) __attribute__((weak));
+//   EDEN_UP_JIT_COMMIT_AHEAD=<1|2>[,<mark %>[,<room MiB>]] (unset or 0: off): once the JIT has written
+//     <mark> % (0 to 99, default 75) of a code cache's newest 16 MiB step, the next step is mapped one
+//     2 MiB block per compiled block, from the pool only, while the pool's largest free piece (less what ahead took
+//     since that reading) leaves <room> MiB (2 to 1024, default 32) free once the step is whole, the
+//     guest's reserve is full to its keeper's mark and nothing waits for memory, another cache's need
+//     included (1: count only, 2: map) (src/memory_pages.cpp, CommitAhead). env.txt only.
+//   EDEN_TEST_JIT_COMMIT_REFUSE=<n>[,<after s>[,<where>]] (a test): from <after s> s on, the next <n>
+//     2 MiB blocks the code caches ask for are refused as if the pool had none; <where> a sum of 1 at
+//     the need (default), 2 ahead, 4 only inside a guest core's block compile, 8 only while the guest's
+//     reserve is at or under its floor, 16 <n> is milliseconds: every such ask is refused for <n> ms from
+//     the first refusal. A cache's first step never (src/memory_pages.cpp).
+// Three numbers a,b,c (b and c may be missing): false when the text is anything else.
+static bool ParseUpTo3(const char* text, unsigned long* out, unsigned* parts) {
+    *parts = 0;
+    while (*parts < 3) {
+        if (*text < '0' || *text > '9') return false;
+        char* end = nullptr;
+        out[(*parts)++] = std::strtoul(text, &end, 10);
+        if (end == nullptr) return false;
+        if (*end == '\0') return true;
+        if (*end != ',') return false;
+        text = end + 1;
+    }
+    return false;
+}
 extern "C" void eden_heap_pool_init(void) {
     // EDEN_HEAP_LARGE_MIB=<n> (1 to 32) or EDEN_HEAP_LARGE_KIB=<n> (256 to 32768): requests of that
     // size or more get memory of their own, given back when they are freed
@@ -120,6 +158,63 @@ extern "C" void eden_heap_pool_init(void) {
         rescue != nullptr && rescue[0] == '1' && rescue[1] == '\0' && eden_heap_set_rescue) {
         eden_heap_set_rescue(1);
         std::fputs("EDEN_UP_HEAP_RESCUE a request about to be refused is asked of every arena first\n", stderr);
+    }
+    if (const char* const steal = std::getenv("EDEN_UP_HEAP_STEAL");
+        steal != nullptr && steal[0] >= '1' && steal[0] <= '3' && steal[1] == '\0' && eden_heap_set_steal) {
+        const int mode = steal[0] - '0';
+        eden_heap_set_steal(mode);
+        std::fprintf(stderr, "EDEN_UP_HEAP_STEAL mode %d: %s\n", mode,
+                     mode == 1   ? "requests about to be refused count the idle arenas, and still fail"
+                     : mode == 2 ? "requests about to be refused are served from arenas no thread is on"
+                                 : "requests about to be refused are served from arenas no thread is on, small ones "
+                                   "keep the arena, and idle arenas come before the pool while it says no");
+    }
+    if (const char* const no_grow = std::getenv("EDEN_TEST_HEAP_NO_GROW");
+        no_grow != nullptr && no_grow[0] >= '1' && no_grow[0] <= '9' && eden_heap_set_no_grow) {
+        char* end = nullptr;
+        const unsigned long every = std::strtoul(no_grow, &end, 10);
+        unsigned long after_s = 0;
+        if (end != nullptr && *end == ',')
+            after_s = std::strtoul(end + 1, &end, 10);
+        if (end != nullptr && *end == '\0' && every <= 100000 && after_s <= 86400) {
+            eden_heap_set_no_grow(static_cast<unsigned>(every), static_cast<unsigned>(after_s));
+            std::fprintf(stderr, "EDEN_TEST_HEAP_NO_GROW every %lu-th growth of the heap is refused as if the pool "
+                         "had no memory, from %lu s on\n", every, after_s);
+        }
+    }
+    if (const char* const ahead = std::getenv("EDEN_UP_JIT_COMMIT_AHEAD"); ahead != nullptr) {
+        unsigned long v[3] = {0, 75, 32};
+        unsigned parts = 0;
+        if (ParseUpTo3(ahead, v, &parts) && v[0] >= 1 && v[0] <= 2 && v[1] <= 99 && v[2] >= 2 && v[2] <= 1024) {
+            Common::SetCodeCommitAhead(static_cast<int>(v[0]), static_cast<unsigned>(v[1]), v[2]);
+            std::fprintf(stderr,
+                         "EDEN_UP_JIT_COMMIT_AHEAD mode %lu: once %lu %% of a code cache's newest step is written, the "
+                         "next is %s from the pool while its largest free piece leaves %lu MiB free once the step is "
+                         "whole, the guest's reserve is full and nothing waits for memory (never from the reserve)\n",
+                         v[0], v[1], v[0] == 1 ? "counted, not mapped," : "mapped a 2 MiB block a compiled block", v[2]);
+        } else if (!(ahead[0] == '0' && ahead[1] == '\0') && ahead[0] != '\0') {
+            std::fprintf(stderr, "EDEN_UP_JIT_COMMIT_AHEAD '%s' not understood: off (<1|2>[,<mark 0-99>[,<room MiB 2-1024>]])\n",
+                         ahead);
+        }
+    }
+    if (const char* const refuse = std::getenv("EDEN_TEST_JIT_COMMIT_REFUSE"); refuse != nullptr && refuse[0] != '\0') {
+        unsigned long v[3] = {0, 0, 1};
+        unsigned parts = 0;
+        if (ParseUpTo3(refuse, v, &parts) && v[0] >= 1 && v[0] <= 1000000 && v[1] <= 86400 && v[2] <= 31 &&
+            (v[2] & 3) != 0 && ((v[2] & 16) == 0 || v[0] <= 60000)) {
+            Common::SetCodeCommitRefuse(v[0], static_cast<unsigned>(v[1]), static_cast<unsigned>(v[2]));
+            std::fprintf(stderr,
+                         "EDEN_TEST_JIT_COMMIT_REFUSE %s %lu %s the code caches ask for%s%s are refused as if the pool "
+                         "had none, from %lu s on%s%s (a cache's first step never)\n",
+                         (v[2] & 16) != 0 ? "for" : "the next", v[0],
+                         (v[2] & 16) != 0 ? "ms from the first refusal, all blocks" : "blocks",
+                         (v[2] & 1) != 0 ? " at the need" : "", (v[2] & 2) != 0 ? " ahead" : "", v[1],
+                         (v[2] & 4) != 0 ? ", only inside a guest core's block compile" : "",
+                         (v[2] & 8) != 0 ? ", only while the guest's reserve is at or under its floor" : "");
+        } else {
+            std::fprintf(stderr, "EDEN_TEST_JIT_COMMIT_REFUSE '%s' not understood: off (<n>[,<after s>[,<where 1-31, "
+                                 "with 1 or 2; with 16, n at most 60000 ms>]])\n", refuse);
+        }
     }
     if (const std::uint64_t mib = EnvMib("EDEN_BIG_IMAGE_RESERVE_MIB"); mib != 0)
         Common::TakeBigImageReserve(static_cast<std::size_t>(mib));

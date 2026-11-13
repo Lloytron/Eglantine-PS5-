@@ -163,6 +163,15 @@ std::atomic<std::size_t> reserve_floor{128};
 std::int64_t reserve[ReserveBlocks];
 std::atomic<std::size_t> reserve_count{0};
 std::atomic_flag reserve_lock = ATOMIC_FLAG_INIT;
+// EDEN_UP_RADV_OOM_LEND (eden_guest_reserve_lend_quiet, for the driver's out-of-memory callback): blocks
+// lent under the floor stay lent for 2 s, the keeper filling the reserve no further than the floor that
+// lend went down to until then, so it does not take them back before the driver has asked again. The
+// lender writes them (any thread inside the driver, under the callback's mutex), the keeper reads them;
+// 0 until the first such lend, and then the keeper only compares one time with the clock.
+#ifdef PS5_NATIVE
+std::atomic<std::uint64_t> keeper_hold_until_ns{0};
+std::atomic<std::size_t> keeper_hold_floor{0};
+#endif
 constexpr std::size_t SharedBlocks = 4096;
 std::int64_t shared_block[SharedBlocks];
 int shared_refs[SharedBlocks];
@@ -283,6 +292,12 @@ int UnshareBlock(std::int64_t physical) noexcept {
 //                            20 s at Ocarina's first 3D frame (run 149), faster than cold slots can
 //                            leave, and at an area change the slots that come back make the thrash
 //                            guard hold everything. Packed in calm play, the room is there before.
+//   EDEN_GUEST_SWAP_AHEAD_MIB=auto  picks n by firmware (kern.sdk_version): 12288 below 13, 2048 from 13
+//                            on, and 2048 when the firmware cannot be read (below 12 is untested; the
+//                            line says so). Any case, spaces before it allowed. 13.x consoles showed about
+//                            1 GiB less free at the same point, and with 12288 they ran out of memory
+//                            at the first door; 2048 is the value testers run there. A number still wins,
+//                            and unset is still 0. One EDEN_SWAP_AHEAD line says what was chosen.
 // Only the game's application pool is armed. The guest's kernel keeps real C++ objects in this
 // backing too (KThread and the other slab heaps, with mutexes and condition variables in them), and
 // the system's and the applets' pools hold what the emulator itself reads all the time. The core
@@ -1368,12 +1383,28 @@ std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
 // game's own memory comes first: a large open-world game wrote 1.8 GB of new memory within 10 s
 // after 23 minutes of play, faster than the caches free at the end of each frame, and the write
 // that found no block ended the session. So the writer waits here, in its fault handler, and tries
-// again every 20 ms for up to 2 s while the caches give memory back. Only then is it refused.
+// again every 20 ms while the caches give memory back: for up to EDEN_UP_GUEST_WRITE_WAIT_MS (his
+// name EDEN_GUEST_WRITE_WAIT_MS is read too), 2 s unset (headless/memory_wait.h: a native port's game
+// pages gave up at 3 s and survived at 10 s at an area change). Only then is it refused. The limit is
+// read at the first wait, which is long after the game's env file is in, and kept. Unset: the old
+// 100 steps and the old kernel-log line, word for word.
+unsigned GuestWriteWaitMs() noexcept {
+    static std::atomic<unsigned> kept{0};
+    unsigned ms = kept.load(std::memory_order_relaxed);
+    if (ms == 0) {
+        ms = ::Eden::MemoryWait::ReadMs2("EDEN_UP_GUEST_WRITE_WAIT_MS", "EDEN_GUEST_WRITE_WAIT_MS", 2000, 20, 60000);
+        kept.store(ms, std::memory_order_relaxed);
+    }
+    return ms;
+}
+
 template <typename Promote>
 bool WaitForBlock(Promote&& promote) noexcept {
     memory_waiters.fetch_add(1, std::memory_order_acq_rel);
     bool ok = false;
-    for (unsigned tries = 0; tries < 100 && !ok; ++tries) {
+    const unsigned wait_ms = GuestWriteWaitMs();
+    const unsigned limit = ::Eden::MemoryWait::Steps(wait_ms);
+    for (unsigned tries = 0; tries < limit && !ok; ++tries) {
         const timespec pause{0, 20'000'000};
         nanosleep(&pause, nullptr);
         ok = promote();
@@ -1381,7 +1412,9 @@ bool WaitForBlock(Promote&& promote) noexcept {
     memory_waiters.fetch_sub(1, std::memory_order_acq_rel);
     (ok ? memory_waits_won : memory_waits_lost).fetch_add(1, std::memory_order_relaxed);
     Note(ok ? "EDEN_CRAM a written slot waited for the graphics caches to give memory back, and got a block\n"
-            : "EDEN_CRAM a written slot waited 2 s for memory and found no block\n");
+         : wait_ms == 2000
+             ? "EDEN_CRAM a written slot waited 2 s for memory and found no block\n"
+             : "EDEN_CRAM a written slot waited its whole limit (EDEN_UP_GUEST_WRITE_WAIT_MS) for memory and found no block\n");
     return ok;
 }
 } // namespace
@@ -1449,6 +1482,192 @@ extern "C" std::size_t eden_guest_reserve_lend(std::size_t bytes) noexcept {
     return 0;
 #endif
 }
+
+#ifdef PS5_NATIVE
+namespace {
+// EDEN_UP_RADV_OOM_LEND's counters (eden_guest_reserve_lend_stats): relaxed, any thread.
+std::atomic<std::uint64_t> oom_lend_calls{0}, oom_lend_bytes{0}, oom_lend_adjacent{0}, oom_lend_refused_waiting{0},
+    oom_lend_none_left{0};
+// The blocks a lend to the driver always leaves (or the floor, if that is lower), whatever the switch
+// says: guest writes the pool refuses and page table slots take the reserve down to 0, and a write
+// that then finds none ends the session 2 s later.
+constexpr std::size_t OomLendKeep = 8;
+} // namespace
+#endif
+
+// EDEN_UP_RADV_OOM_LEND (headless/performance.cpp, the driver's out-of-memory callback): what
+// eden_guest_reserve_lend does, down to `below_floor` blocks under the floor, and without its line: the
+// caller is a thread inside the driver with the pool empty, where stdio may ask the heap for memory (the
+// callback's own line says what went). Not while a guest write waits for a block, as there; the keeper
+// fills no further than the lend's floor for the next 2 s. What went back, in bytes.
+extern "C" std::size_t eden_guest_reserve_lend_quiet(std::size_t bytes, std::size_t below_floor) noexcept {
+#ifdef PS5_NATIVE
+    if (service_range.load(std::memory_order_acquire) == nullptr) return 0;
+    oom_lend_calls.fetch_add(1, std::memory_order_relaxed);
+    if (memory_waiters.load(std::memory_order_acquire) != 0) {
+        oom_lend_refused_waiting.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    const std::size_t floor_now = reserve_floor.load(std::memory_order_relaxed);
+    const std::size_t keep = std::min(floor_now, OomLendKeep);
+    const std::size_t floor = floor_now > below_floor + keep ? floor_now - below_floor : keep;
+    std::size_t lent = 0, adjacent = 0;
+    Spin(reserve_lock);
+    std::size_t count = reserve_count.load(std::memory_order_relaxed);
+    while (lent < bytes && count > floor) {
+        const std::int64_t block = reserve[count - 1];
+        if (sceKernelReleaseDirectMemory(block, SparseSlot) != 0) break;
+        if (count >= 2 && reserve[count - 2] + static_cast<std::int64_t>(SparseSlot) == block) ++adjacent;
+        --count;
+        lent += SparseSlot;
+    }
+    reserve_count.store(count, std::memory_order_relaxed);
+    reserve_lock.clear(std::memory_order_release);
+    if (lent != 0) {
+        keeper_hold_floor.store(floor, std::memory_order_relaxed);
+        keeper_hold_until_ns.store(NowNs() + 2'000'000'000ull, std::memory_order_release);
+    } else {
+        oom_lend_none_left.fetch_add(1, std::memory_order_relaxed);
+    }
+    oom_lend_bytes.fetch_add(lent, std::memory_order_relaxed);
+    oom_lend_adjacent.fetch_add(adjacent, std::memory_order_relaxed);
+    return lent;
+#else
+    (void)bytes;
+    (void)below_floor;
+    return 0;
+#endif
+}
+
+// ---- EDEN_UP_JIT_LEND_UNDER_FLOOR: a code cache piece from the reserve, under its floor ----
+//
+// The JIT's code cache asks for its next 16 MiB step one 2 MiB piece at a time (memory_pages.cpp
+// CommitCodeStep). A piece the pool refuses could come from the reserve only above its floor
+// (EDEN_JIT_RESERVE_LEND); with the reserve under it the JIT waited 2 s and ended the session (owner's
+// T130 play, 11 Nov: 28 blocks held, floor 32, 0 lent, abort). With this switch such a piece takes one
+// block of the reserve straight over, under the reserve's lock (never given to the pool and asked
+// back, where the driver or the heap could take it first), down to JitLendKeep blocks and never
+// further. One block per refused piece, so never more than the step still needs. Only CommitCodeStep
+// calls it. Not while a game write waits for a block (that write has emptied the reserve anyway).
+// The keeper fills the reserve again from the pool as it does after any game write took from it.
+//   EDEN_UP_JIT_LEND_UNDER_FLOOR=1  count only: what would have been lent; the piece is refused as before
+//   EDEN_UP_JIT_LEND_UNDER_FLOOR=2  lend
+// Read once as the service starts. Unset or 0: one relaxed load on the refused path, and the old path.
+//
+// The minimum: guest writes that the pool refuses take the reserve one block each and may empty it,
+// and a write that then finds none waits 2 s and ends the session. The owner's T130 session took the
+// reserve 11 blocks under its floor of 32 at the passage stall (21 left, the deepest of the session)
+// and 12 blocks within one ledger window there (reserve_used 103 -> 115); everywhere else 1-7. 16 blocks
+// (32 MiB) cover that burst with 4 to spare, twice what the driver's lend keeps (OomLendKeep).
+#ifdef PS5_NATIVE
+namespace {
+constexpr std::size_t JitLendKeep = 16;
+std::atomic<int> jit_lend_mode{0};
+// Counters for the line every 10 s (ReserveKeeper): relaxed, any thread.
+std::atomic<std::uint64_t> jit_lend_asked{0}, jit_lend_lent{0}, jit_lend_would{0}, jit_lend_at_keep{0},
+    jit_lend_writer_waits{0};
+std::atomic<std::size_t> jit_lend_lowest{ReserveBlocks}; // the fewest blocks a lend left
+} // namespace
+#endif
+
+// 1: a block of the reserve is now the caller's (`physical`); 0: none (switch off, a write waits, or the
+// reserve is at the minimum; in count mode also when one could have gone). `left`: blocks after it.
+// `why`: 0 off, 1 count only (one could have gone), 2 at the minimum, 3 a game write waits.
+// Called by CommitCodeStep with code_mutex held; takes the reserve's spin lock for a few loads only
+// (no system call inside it, unlike the lends that give blocks to the pool).
+int JitLendUnderFloor(std::int64_t* physical, std::size_t* left, int* why) noexcept {
+#ifdef PS5_NATIVE
+    const int mode = jit_lend_mode.load(std::memory_order_relaxed);
+    *why = 0;
+    if (mode == 0 || service_range.load(std::memory_order_acquire) == nullptr) return 0;
+    jit_lend_asked.fetch_add(1, std::memory_order_relaxed);
+    if (memory_waiters.load(std::memory_order_acquire) != 0) {
+        jit_lend_writer_waits.fetch_add(1, std::memory_order_relaxed);
+        *left = reserve_count.load(std::memory_order_relaxed);
+        *why = 3;
+        return 0;
+    }
+    Spin(reserve_lock);
+    std::size_t count = reserve_count.load(std::memory_order_relaxed);
+    const bool can = count > JitLendKeep;
+    if (can && mode == 2) {
+        *physical = reserve[count - 1];
+        reserve_count.store(--count, std::memory_order_relaxed);
+    }
+    reserve_lock.clear(std::memory_order_release);
+    *left = count;
+    if (!can) {
+        jit_lend_at_keep.fetch_add(1, std::memory_order_relaxed);
+        *why = 2;
+        return 0;
+    }
+    if (mode != 2) {
+        jit_lend_would.fetch_add(1, std::memory_order_relaxed);
+        *why = 1;
+        return 0;
+    }
+    jit_lend_lent.fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t low = jit_lend_lowest.load(std::memory_order_relaxed);
+         count < low && !jit_lend_lowest.compare_exchange_weak(low, count, std::memory_order_relaxed);)
+        ;
+    return 1;
+#else
+    (void)physical;
+    (void)left;
+    *why = 0;
+    return 0;
+#endif
+}
+
+#ifdef PS5_NATIVE
+namespace {
+// From the keeper, every 100 ms while the switch is on: the 10 s line. (Its test is T132's shared
+// EDEN_TEST_JIT_COMMIT_REFUSE, memory_pages.cpp: a refusal at the need comes here after the old lend.)
+void JitLendTick(std::uint64_t now) noexcept {
+    static std::uint64_t reported_ns = 0; // the keeper's own
+    const int mode = jit_lend_mode.load(std::memory_order_relaxed);
+    if (mode != 0 && now - reported_ns >= 10'000'000'000ull) {
+        reported_ns = now;
+        const std::size_t lowest = jit_lend_lowest.load(std::memory_order_relaxed);
+        char line[400];
+        const int length = std::snprintf(
+            line, sizeof(line),
+            "EDEN_UP_JIT_LEND_UNDER_FLOOR mode %d: %llu refused pieces asked, %llu lent (%llu MiB), %llu would "
+            "have been lent (count only), %llu found the reserve at its minimum of %zu, %llu refused while a game "
+            "write waited; reserve %zu blocks (floor %zu, target %zu), fewest after a lend %zu (0: no lend yet)\n",
+            mode, (unsigned long long)jit_lend_asked.load(std::memory_order_relaxed),
+            (unsigned long long)jit_lend_lent.load(std::memory_order_relaxed),
+            (unsigned long long)jit_lend_lent.load(std::memory_order_relaxed) * (SparseSlot >> 20),
+            (unsigned long long)jit_lend_would.load(std::memory_order_relaxed),
+            (unsigned long long)jit_lend_at_keep.load(std::memory_order_relaxed), JitLendKeep,
+            (unsigned long long)jit_lend_writer_waits.load(std::memory_order_relaxed),
+            reserve_count.load(std::memory_order_relaxed), reserve_floor.load(std::memory_order_relaxed),
+            reserve_target.load(std::memory_order_relaxed), lowest == ReserveBlocks ? std::size_t{0} : lowest);
+        if (length > 0) Report(line);
+    }
+}
+
+// As the service starts: the switch.
+void ReadJitLendSwitches() noexcept {
+    const char* const mode = std::getenv("EDEN_UP_JIT_LEND_UNDER_FLOOR");
+    const int asked = mode != nullptr && (mode[0] == '1' || mode[0] == '2') && mode[1] == '\0' ? mode[0] - '0' : 0;
+    jit_lend_mode.store(asked, std::memory_order_relaxed);
+    for (auto* counter : {&jit_lend_asked, &jit_lend_lent, &jit_lend_would, &jit_lend_at_keep, &jit_lend_writer_waits})
+        counter->store(0, std::memory_order_relaxed);
+    jit_lend_lowest.store(ReserveBlocks, std::memory_order_relaxed);
+    char line[240];
+    if (asked != 0) {
+        const int length = std::snprintf(
+            line, sizeof(line),
+            "EDEN_UP_JIT_LEND_UNDER_FLOOR mode %d: a code cache piece the pool and the reserve above its floor "
+            "refuse %s a reserve block, down to %zu blocks (floor %zu)\n",
+            asked, asked == 2 ? "takes" : "counts what it would take of", JitLendKeep,
+            reserve_floor.load(std::memory_order_relaxed));
+        if (length > 0) Report(line);
+    }
+}
+} // namespace
+#endif
 
 // The guest's headroom (the reserve): what it holds and what it is to hold, in bytes; both 0 while
 // the service does not run or keeps no reserve (the host). headless/performance.cpp counts what is
@@ -1641,8 +1860,26 @@ void ReserveKeeper() {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
-        FillReserve(pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed)
-                                                                  : reserve_target.load(std::memory_order_relaxed));
+        std::size_t blocks = pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed)
+                                                                           : reserve_target.load(std::memory_order_relaxed);
+        // EDEN_UP_RADV_OOM_LEND: for 2 s after a lend to the driver, no further than that lend's floor;
+        // then one line, the hold cleared (a lend meanwhile has set a new one and keeps it), and the
+        // fill as before.
+        if (std::uint64_t hold = keeper_hold_until_ns.load(std::memory_order_acquire); hold != 0) {
+            if (NowNs() < hold) {
+                blocks = std::min(blocks, keeper_hold_floor.load(std::memory_order_relaxed));
+            } else if (keeper_hold_until_ns.compare_exchange_strong(hold, 0, std::memory_order_relaxed)) {
+                char line[128];
+                const int length = std::snprintf(line, sizeof(line),
+                                                 "EDEN_UP_RADV_OOM_LEND hold over: the reserve holds %zu blocks, filled "
+                                                 "again up to %zu\n",
+                                                 reserve_count.load(std::memory_order_relaxed), blocks);
+                if (length > 0) Report(line);
+            }
+        }
+        FillReserve(blocks);
+        // EDEN_UP_JIT_LEND_UNDER_FLOOR's line (off: one relaxed load).
+        if (jit_lend_mode.load(std::memory_order_relaxed) != 0) JitLendTick(NowNs());
         lock.lock();
     }
 }
@@ -2200,8 +2437,37 @@ void ReadSwapSwitches() noexcept {
     const char* all = std::getenv("EDEN_GUEST_SWAP_ALL_POOLS");
     swap_all_pools = all && all[0] == '1';
     swap_ahead_bytes = 0;
-    if (const char* ahead = std::getenv("EDEN_GUEST_SWAP_AHEAD_MIB"))
-        swap_ahead_bytes = static_cast<std::size_t>(std::strtoul(ahead, nullptr, 10)) << 20;
+    if (const char* ahead = std::getenv("EDEN_GUEST_SWAP_AHEAD_MIB")) {
+        unsigned int sdk = 0;
+        std::size_t size = sizeof(sdk);
+        const bool known = sysctlbyname("kern.sdk_version", &sdk, &size, nullptr, 0) == 0 && sdk != 0;
+        // The top byte is the major version in hex digits: 0x12400009 is 12.40, 0x13... is 13.x.
+        const unsigned major = sdk >> 24;
+        const bool from_13 = !known || major >= 0x13;
+        // Spaces and tabs before the value are skipped, and "auto" is matched in any case
+        // (" auto", "Auto", "AUTO\r" are all auto).
+        while (*ahead == ' ' || *ahead == '\t') ++ahead;
+        const auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+        const bool automatic = lower(ahead[0]) == 'a' && lower(ahead[1]) == 'u' && lower(ahead[2]) == 't' &&
+                               lower(ahead[3]) == 'o';
+        char* end = nullptr;
+        const unsigned long number = automatic ? 0ul : std::strtoul(ahead, &end, 10);
+        const bool parsed = !automatic && end != ahead;
+        const unsigned long mib = automatic ? (from_13 ? 2048ul : 12288ul) : number;
+        swap_ahead_bytes = static_cast<std::size_t>(mib) << 20;
+        char line[240];
+        const int length = std::snprintf(line, sizeof(line),
+                                         "EDEN_SWAP_AHEAD %luMiB (%s; firmware sdk_version %s0x%08x; swap mode %d)\n",
+                                         mib,
+                                         !automatic && !parsed ? "not a number: 0, swap-ahead off"
+                                         : !automatic          ? "a number in the settings, used as it is"
+                                         : !known              ? "auto, firmware not known: the 13.x value"
+                                         : from_13             ? "auto, firmware 13 or newer"
+                                         : major == 0x12       ? "auto, firmware 12.x"
+                                                               : "auto, firmware below 12, not tested: the 12.x value",
+                                         known ? "" : "unknown ", sdk, swap_mode.load(std::memory_order_relaxed));
+        if (length > 0) Report(line);
+    }
     const char* high = std::getenv("EDEN_SLOT_VIEW_HIGH");
     slot_view_hint.store(high && high[0] == '1' ? slot_view_high : cpu_mapping_hint, std::memory_order_relaxed);
 #endif
@@ -3027,6 +3293,7 @@ void ServiceStart(SparseRange& range) noexcept {
                              std::memory_order_relaxed);
     }
     FillReserve(ReserveAtStart);
+    ReadJitLendSwitches(); // EDEN_UP_JIT_LEND_UNDER_FLOOR (after the floor)
 #endif
     service_range.store(&range, std::memory_order_release);
     Eden::Fastmem::guest_write_fault.store(&HandleGuestWriteFault, std::memory_order_release);
@@ -3168,6 +3435,58 @@ extern "C" int eden_guest_swap_address_state(const void* host, int* ever_out) no
     return SlotState(*range, slot);
 }
 
+#ifdef PS5_NATIVE
+namespace {
+// EDEN_UP_RADV_OOM_LEND (eden_guest_memory_reclaim_bounded): cold slots out, lowest in the pool first,
+// until `want` bytes went back or 256 slots went; a copy of the loop and the line of
+// eden_guest_memory_reclaim (below), which keeps its own text. `cold` is sorted; the caller holds
+// swap_out_mutex.
+std::size_t ReclaimColdSlots(SparseRange& range, std::size_t want, const std::pair<std::int64_t, std::size_t>* cold,
+                             std::size_t count) noexcept {
+    std::size_t freed = 0, made = 0;
+    const std::uint64_t failed = swap_counters.failures.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < count && made < 256 && freed < want; ++i) {
+        const std::size_t slot = cold[i].second;
+        if (SwapOut(range, slot)) {
+            ++made;
+            // What the slot gave back: all of it to the file, or 2 MiB less its packed pages. Read
+            // after the fact, so a touch that brought it back already counts as nothing.
+            if (SlotState(range, slot) == SlotOut) {
+                const std::int64_t physical = range.physical[slot];
+                freed += InStore(physical) ? pack_shared_given // EDEN_UP_PACK_SHARED: 2 MiB, or 0 for a new slab
+                         : physical < 0    ? SparseSlot
+                                           : SparseSlot - std::min(SparseSlot, PackedPages(range.swap[slot]) * FinePage);
+            }
+            if (slot < SwapEverOutSlots)
+                swap_ever_out[slot / 64].fetch_or(std::uint64_t{1} << (slot % 64), std::memory_order_relaxed);
+        } else if (swap_counters.failures.load(std::memory_order_relaxed) != failed) {
+            break; // no block for the packed bytes, or the file refused: nothing more now
+        }
+    }
+    char line[128];
+    const int length = std::snprintf(line, sizeof(line), "EDEN_SWAP reclaim for graphics: %zu slots, %zu MiB given back (asked %zu MiB)\n",
+                                     made, freed >> 20, want >> 20);
+    if (length > 0) Report(line);
+    return freed;
+}
+
+// EDEN_UP_RADV_OOM_LEND (eden_guest_memory_reclaim_bounded): the candidates, the 8192 lowest in the pool
+// (a max-heap while they are gathered, 128 KiB of static memory: every slot of a 16 GiB guest span, so
+// in practice the same list as the old one, which walks on past slots not worth packing), so nothing is
+// asked of the heap on a driver thread with the pool empty; and swap_tick + 1 of the last scan that
+// found no cold slot (0: none). Both under swap_out_mutex. A slot turns cold almost only when the tick
+// moves on (ArmSlot stamps it with the tick it is armed in). Exceptions, each one slot at a time: the
+// scanner's LendArmedSlot/TakeArmedSlotBack (the slot is Own for a moment and comes back with its old
+// stamp), and an ArmSlot that read the tick just before the swapper moved it. Verify counts those.
+constexpr std::size_t ReclaimCandidates = 8192;
+std::pair<std::int64_t, std::size_t> reclaim_cold[ReclaimCandidates];
+std::uint64_t reclaim_zero_tick = 0;
+// Counters (eden_guest_reserve_lend_stats): relaxed, any thread.
+std::atomic<std::uint64_t> reclaim_scans{0}, reclaim_skipped{0}, reclaim_verified{0}, reclaim_missed{0},
+    reclaim_capped{0};
+} // namespace
+#endif
+
 // A graphics allocation found no memory (the port's MemoryAllocator::ReleaseRefused): cold slots go
 // out now, on the thread that asked, up to `want` bytes given back or 256 slots, the lowest in the
 // pool first. After Aflakon's eden_guest_memory_reclaim (ocarina-cold-memory f0515ee16, patch 1905),
@@ -3220,6 +3539,83 @@ extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) noexcept {
     (void)want;
     return 0;
 #endif
+}
+
+// EDEN_UP_RADV_OOM_LEND: eden_guest_memory_reclaim for the driver's out-of-memory callback
+// (headless/performance.cpp). The same slots in the same order, but the candidates are gathered under
+// swap_out_mutex into a static array (the 8192 lowest in the pool; the old list grew on the heap, and a
+// refusal there would end the session inside the driver, the function being noexcept), and a call in
+// the same swap tick as a scan that found no cold slot scans nothing (see ReclaimCandidates for the
+// one-slot exceptions). At the forest exit (05:37) the ten "0 slots" scans most likely found cold slots
+// that would not pack (no block for the packed bytes), so the skip would not have applied there; it
+// is for a pool empty with nothing armed for long. `verify` != 0 (EDEN_UP_RADV_OOM_LEND_VERIFY=1):
+// that scan runs all the same, and a cold slot it finds is counted as missed. Bytes given back.
+extern "C" std::size_t eden_guest_memory_reclaim_bounded(std::size_t want, int verify) noexcept {
+#ifdef PS5_NATIVE
+    static const bool enabled = std::getenv("EDEN_GUEST_SWAP_RECLAIM") != nullptr && std::getenv("EDEN_GUEST_SWAP_RECLAIM")[0] == '1';
+    const int mode = swap_mode.load(std::memory_order_relaxed);
+    SparseRange* const range = service_range.load(std::memory_order_acquire);
+    if (pack_on_refusal.load(std::memory_order_relaxed) && want >= PackRefusalLarge && (mode == 2 || mode == 3) &&
+        range != nullptr && range->state != nullptr)
+        return PackOnRefusal(*range, want);
+    if (!enabled || (mode != 2 && mode != 3) || range == nullptr || range->state == nullptr) return 0;
+    const std::size_t slots = (range->end - range->begin.load(std::memory_order_relaxed)) / SparseSlot;
+    const std::lock_guard out_lock{swap_out_mutex};
+    const std::uint32_t now = swap_tick.load(std::memory_order_relaxed);
+    const bool same_tick = reclaim_zero_tick == static_cast<std::uint64_t>(now) + 1;
+    if (same_tick && verify == 0) {
+        reclaim_skipped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
+    reclaim_scans.fetch_add(1, std::memory_order_relaxed);
+    std::size_t count = 0, found = 0;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (SlotState(*range, slot) != SlotProbe || now - range->swap[slot] < 1) continue;
+        ++found;
+        const std::pair<std::int64_t, std::size_t> entry{range->physical[slot], slot};
+        if (count < ReclaimCandidates) {
+            reclaim_cold[count++] = entry;
+            std::push_heap(reclaim_cold, reclaim_cold + count);
+        } else if (entry < reclaim_cold[0]) {
+            std::pop_heap(reclaim_cold, reclaim_cold + count);
+            reclaim_cold[count - 1] = entry;
+            std::push_heap(reclaim_cold, reclaim_cold + count);
+        }
+    }
+    reclaim_zero_tick = found == 0 ? static_cast<std::uint64_t>(now) + 1 : 0;
+    if (found > count) reclaim_capped.fetch_add(1, std::memory_order_relaxed);
+    if (same_tick) {
+        reclaim_verified.fetch_add(1, std::memory_order_relaxed);
+        if (found != 0) reclaim_missed.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::sort_heap(reclaim_cold, reclaim_cold + count);
+    return ReclaimColdSlots(*range, want, reclaim_cold, count);
+#else
+    (void)want;
+    (void)verify;
+    return 0;
+#endif
+}
+
+// EDEN_UP_RADV_OOM_LEND's counters for the line every 10 s (headless/performance.cpp), in this order:
+// lend calls, bytes lent, lent blocks beside the next, lends refused while a guest write waited, lends
+// that found nothing above the lowered floor, bounded scans, scans skipped (same tick, none cold), scans
+// verified (would have been skipped), of those the ones that found cold slots, scans with more cold slots
+// than candidates, reserve blocks held now. At most `count` of them are written; all 0 off the console.
+extern "C" void eden_guest_reserve_lend_stats(unsigned long long* values, std::size_t count) noexcept {
+#ifdef PS5_NATIVE
+    const unsigned long long all[] = {
+        oom_lend_calls.load(std::memory_order_relaxed),     oom_lend_bytes.load(std::memory_order_relaxed),
+        oom_lend_adjacent.load(std::memory_order_relaxed),  oom_lend_refused_waiting.load(std::memory_order_relaxed),
+        oom_lend_none_left.load(std::memory_order_relaxed), reclaim_scans.load(std::memory_order_relaxed),
+        reclaim_skipped.load(std::memory_order_relaxed),    reclaim_verified.load(std::memory_order_relaxed),
+        reclaim_missed.load(std::memory_order_relaxed),     reclaim_capped.load(std::memory_order_relaxed),
+        reserve_count.load(std::memory_order_relaxed),
+    };
+#else
+    const unsigned long long all[11] = {};
+#endif
+    for (std::size_t i = 0; i < count && i < sizeof(all) / sizeof(all[0]); ++i) values[i] = all[i];
 }
 
 // The report now, for a burst of writes that falls between two of the scanner's (headless/performance.cpp).

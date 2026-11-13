@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "performance.h"
+#include "memory_wait.h"
 #include "crash_report.h"
 #include "stall_watchdog.h"
 #include "../src/fastmem.h"
 #include "common/cpu_features.h"
+#include "common/live_switch.h"
 #include "common/pe_switch.h"
 #include "common/sparse_large_vector.h"
 #include <string_view>
@@ -651,14 +653,27 @@ extern "C" void eden_heap_wait_gpu_stats(unsigned long long* count, unsigned lon
                                          unsigned long long* lost) __attribute__((weak));
 // EDEN_UP_HEAP_RESCUE: requests about to be refused that an arena served, and those none could.
 extern "C" void eden_heap_rescue_stats(unsigned long long* rescued, unsigned long long* missed) __attribute__((weak));
+// EDEN_UP_HEAP_STEAL: its mode (0 off) and its counters, in the order of the enum in heap_arenas.inc.
+extern "C" int eden_heap_steal_mode_now(void) __attribute__((weak));
+extern "C" unsigned eden_heap_steal_stats(unsigned long long* values, unsigned count) __attribute__((weak));
 // EDEN_TEST_HEAP_STARVE: test shortages begun on pipeline builder threads (with EDEN_TEST_HEAP_STARVE_GPU=1:
 // inside run-time pipeline builds), and requests refused in them.
 extern "C" void eden_heap_starve_stats(unsigned long long* begun, unsigned long long* refused) __attribute__((weak));
+// T130: both heap test aids' own counts (EDEN_TEST_HEAP_STARVE, EDEN_TEST_HEAP_NO_GROW), whatever the
+// steal mode, in the order heap_arenas.inc's eden_heap_test_aid_stats gives them.
+extern "C" unsigned eden_heap_test_aid_stats(unsigned long long* values, unsigned count) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
 extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
 extern "C" void eden_guest_memory_waits(unsigned long long* won, unsigned long long* lost,
                                         unsigned long long* refused) __attribute__((weak));
+// EDEN_UP_RADV_OOM_LEND (src/guest_memory_service.inc): the guest reserve's lends to the driver and the
+// bounded reclaim's scans, for the line every 10 s.
+extern "C" void eden_guest_reserve_lend_stats(unsigned long long* values, std::size_t count) __attribute__((weak));
+// EDEN_UP_JIT_COMMIT_AHEAD / EDEN_TEST_JIT_COMMIT_REFUSE (src/memory_pages.cpp): whether either is set,
+// and their counters for the line every 10 s.
+extern "C" int eden_jit_ahead_active(void) __attribute__((weak));
+extern "C" int eden_jit_ahead_stats(unsigned long long* values, std::size_t count) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
@@ -744,11 +759,11 @@ struct MemorySummaryNumbers {
     std::size_t largest{};
     bool memory_short{};
 };
-static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers summary = {}) {
+static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers summary = {}, bool heap = false) {
     struct Pending {
         std::mutex mutex;
         std::condition_variable changed;
-        bool report{}, trim{}, started{};
+        bool report{}, trim{}, started{}, heap{};
         MemorySummaryNumbers summary;
     };
     static Pending* const pending = new Pending;  // outlives every static destructor
@@ -756,27 +771,32 @@ static void QueueOffThreadReport(bool report, bool trim, MemorySummaryNumbers su
         std::scoped_lock lock{pending->mutex};
         pending->report |= report;
         pending->trim |= trim;
+        pending->heap |= heap;
         if (summary.due) pending->summary = summary;
         if (!pending->started) {
             pending->started = true;
             std::thread([] {
                 RegisterWorker("MemoryReport");
                 for (;;) {
-                    bool do_report, do_trim;
+                    bool do_report, do_trim, do_heap;
                     MemorySummaryNumbers do_summary;
                     {
                         std::unique_lock lock{pending->mutex};
                         pending->changed.wait(lock, [] {
-                            return pending->report || pending->trim || pending->summary.due;
+                            return pending->report || pending->trim || pending->heap || pending->summary.due;
                         });
                         do_report = pending->report;
                         do_trim = pending->trim;
+                        do_heap = pending->heap;
                         do_summary = pending->summary;
-                        pending->report = pending->trim = false;
+                        pending->report = pending->trim = pending->heap = false;
                         pending->summary = {};
                     }
                     if (do_report && eden_guest_memory_report) eden_guest_memory_report();
                     if (do_trim) TrimHeap("the pool is short");
+                    // EDEN_UP_HEAP_STEAL: the heap's table (arena by arena, space by space) at its brink;
+                    // "refused" lets ReportHeap's own limit (30 s, then 2 min) pass it.
+                    if (do_heap) ReportHeap("refused: the heap could not grow (EDEN_UP_HEAP_STEAL)");
                     if (do_summary.due) WriteMemorySummary(do_summary.largest, do_summary.memory_short);
                 }
             }).detach();
@@ -828,6 +848,16 @@ static void WriteMemorySummary(std::size_t largest, bool memory_short) {
                          gpu_scope ? "inside run-time pipeline builds" : "on pipeline builder threads", refused);
         }
     }
+    // T130: the test aids' own counts in every 20 s summary while one is set, so a control run (steal
+    // off) shows them too: requests seen and refused, and what the steal did with the refusals.
+    if (eden_heap_test_aid_stats) {
+        unsigned long long aid[9] = {};
+        eden_heap_test_aid_stats(aid, 9);
+        if (aid[0] != 0 || aid[6] != 0)
+            std::fprintf(stderr, "EDEN_TEST_HEAP_AIDS starve every %llu: seen %llu, shortages %llu, refused %llu, "
+                         "sent to the steal %llu, served by it %llu; no_grow every %llu: growths seen %llu, refused %llu\n",
+                         aid[0], aid[1], aid[2], aid[3], aid[4], aid[5], aid[6], aid[7], aid[8]);
+    }
     ReportLedger();
     // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
     // the walk a refusal makes). available_mib is the largest block, the ledger the sum: only
@@ -848,6 +878,199 @@ static void WriteMemorySummary(std::size_t largest, bool memory_short) {
                          won, lost, refused);
         }
     }
+}
+// EDEN_UP_RADV_OOM_LEND: the driver's out-of-memory callbacks while it is on (eden_radv_out_of_memory,
+// any driver thread under the callback's mutex): how many, how much the guest reserve lent them, and how
+// many ended with at least the asked size rounded up to 2 MiB given back (covered) or not (short).
+std::atomic<unsigned long long> radv_oom_callbacks{0}, radv_oom_lent{0}, radv_oom_covered{0}, radv_oom_short{0};
+// Their line every 10 s while the switch is on, from RefreshFreeMemory (the GPU thread; one caller
+// writes it, the time is taken by a compare-exchange).
+static void ReportRadvOomLend(long long now, long long lend) {
+    static std::atomic<long long> reported_ns{0};
+    long long last = reported_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000 || !reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        return;
+    unsigned long long guest[11] = {};
+    if (eden_guest_reserve_lend_stats) eden_guest_reserve_lend_stats(guest, 11);
+    std::fprintf(stderr,
+                 "EDEN_UP_RADV_OOM_LEND %lld blocks under the floor: %llu callbacks (%llu covered, %llu short), "
+                 "%llu MiB lent (%llu lends, %llu blocks beside the next, %llu refused while a guest write waited, "
+                 "%llu found nothing above the lowered floor); reclaim %llu scans, %llu skipped in the same tick, "
+                 "%llu verified (%llu would have missed cold slots), %llu over the candidates; reserve %llu MiB\n",
+                 lend, radv_oom_callbacks.load(std::memory_order_relaxed),
+                 radv_oom_covered.load(std::memory_order_relaxed), radv_oom_short.load(std::memory_order_relaxed),
+                 radv_oom_lent.load(std::memory_order_relaxed) >> 20, guest[0], guest[2], guest[3], guest[4], guest[5],
+                 guest[6], guest[7], guest[8], guest[9], guest[10] * 2);
+}
+// EDEN_UP_NEW_WAIT_MS (headless/memory_wait.h, main.cpp's new handler): from RefreshFreeMemory (every
+// 100 ms at most, on the GPU thread) while it is on. Its counters every 10 s, when one has moved. While
+// the GPU thread itself is the one waiting this line pauses too; the handler's own start and gave-up
+// lines still come. "Not given up" = begun - gave up: served, or still going (waiting now).
+static void ReportNewWait(long long now) {
+    namespace MemoryWait = Eden::MemoryWait;
+    auto& c = MemoryWait::counters;
+    static std::atomic<long long> reported_ns{0};
+    static std::atomic<unsigned long long> reported_sum{0};
+    long long last = reported_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000) return;
+    const unsigned long long begun = c.begun.load(std::memory_order_relaxed);
+    const unsigned long long gave_up = c.gave_up.load(std::memory_order_relaxed);
+    const unsigned long long steps = c.steps.load(std::memory_order_relaxed);
+    const unsigned long long cooldown = c.cooldown.load(std::memory_order_relaxed);
+    const unsigned long long too_big = c.too_big.load(std::memory_order_relaxed);
+    const unsigned long long at_once = c.at_once.load(std::memory_order_relaxed);
+    const unsigned long long sum = begun + gave_up + steps + cooldown + too_big + at_once;
+    if (sum == reported_sum.load(std::memory_order_relaxed) ||
+        !reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        return;
+    reported_sum.store(sum, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "EDEN_UP_NEW_WAIT limit=%u ms waits begun %llu, gave up %llu, not given up %llu (other size within "
+                 "60 s %llu); 20 ms steps %llu (%llu ms asleep in all), heap trims %llu, longest %u ms asleep, waiting "
+                 "now %u; thrown at once: same size again within 60 s %llu, cooldown %llu, over 1 GiB %llu\n",
+                 MemoryWait::new_wait_ms.load(std::memory_order_relaxed), begun, gave_up,
+                 begun >= gave_up ? begun - gave_up : 0ULL, c.other_size.load(std::memory_order_relaxed), steps,
+                 steps * 20, c.trims.load(std::memory_order_relaxed), c.longest_ms.load(std::memory_order_relaxed),
+                 c.waiting.load(std::memory_order_relaxed), at_once, cooldown, too_big);
+}
+// EDEN_UP_JIT_COMMIT_AHEAD and its test (src/memory_pages.cpp): from RefreshFreeMemory (every 100 ms at
+// most, on the GPU thread) while either is set. Its counters every 10 s, when one has moved. "Mapped ahead,
+// not yet written" is memory the code caches hold before they need it; "?" when a cache was mapping.
+static void ReportJitAhead(long long now) {
+    constexpr std::size_t kValues = 19; // 14 counts, then held now, held most, test left, mark, room
+    unsigned long long v[kValues] = {};
+    static std::atomic<long long> reported_ns{0};
+    static std::atomic<unsigned long long> reported_sum{0};
+    long long last = reported_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000) return;
+    const int mode = eden_jit_ahead_stats(v, kValues);
+    unsigned long long sum = 0;
+    for (std::size_t i = 0; i < 14; ++i) sum += v[i];
+    if (sum == reported_sum.load(std::memory_order_relaxed) ||
+        !reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        return;
+    reported_sum.store(sum, std::memory_order_relaxed);
+    char held_now[32];
+    if (v[14] == ~0ULL)
+        std::snprintf(held_now, sizeof(held_now), "?");
+    else
+        std::snprintf(held_now, sizeof(held_now), "%llu", v[14] >> 20);
+    std::fprintf(stderr,
+                 "EDEN_UP_JIT_COMMIT_AHEAD mode=%d mark=%llu%% room=%llu MiB: marks passed %llu; mapped ahead %llu "
+                 "blocks (%llu MiB), %llu whole steps; count only, would have mapped %llu steps; no room %llu "
+                 "(largest free under the room) %llu (reserve not full) %llu (a write waiting) %llu (pool not "
+                 "known); pool refused %llu, lock busy %llu; steps taken at the need %llu (%llu with no room since "
+                 "the mark or no mark seen, %llu finished from blocks mapped ahead); mapped ahead, not yet "
+                 "written: %s MiB now, %llu MiB most; test refusals %llu, left %llu\n",
+                 mode, v[17], v[18] >> 20, v[0], v[2], v[2] * 2, v[3], v[1], v[4], v[5], v[6], v[7], v[8], v[9],
+                 v[10], v[11], v[12], held_now, v[15] >> 20, v[13], v[16]);
+}
+// EDEN_UP_JIT_COMMIT_RECLAIM (headless/memory_wait.h, jit-allocator.h): from RefreshFreeMemory (every
+// 100 ms at most, on the GPU thread) while the mode is not 0. Its counters every 10 s, when one has moved.
+// The waits' own lines (served / ran out / cleared) come from the waiting thread.
+static void ReportJitReclaim(long long now) {
+    namespace MemoryWait = Eden::MemoryWait;
+    auto& c = MemoryWait::jit_reclaim;
+    static std::atomic<long long> reported_ns{0};
+    static std::atomic<unsigned long long> reported_sum{0};
+    long long last = reported_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000) return;
+    const unsigned long long waits = c.waits.load(std::memory_order_relaxed);
+    const unsigned long long reclaims = c.reclaims.load(std::memory_order_relaxed);
+    const unsigned long long busy = c.reclaim_busy.load(std::memory_order_relaxed);
+    const unsigned long long sum = waits + reclaims + busy;
+    if (sum == reported_sum.load(std::memory_order_relaxed) ||
+        !reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        return;
+    reported_sum.store(sum, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "EDEN_UP_JIT_COMMIT_RECLAIM mode=%u waits %llu: served at once after a reclaim or trim %llu, by a "
+                 "20 ms retry %llu, cleared instead of ending %llu, ended by another core's clear %llu, ended the "
+                 "session %llu (clear capped %llu, mode 1 would clear %llu); reclaims %llu (scanned %llu, skipped "
+                 "%llu, another core reclaiming %llu) gave %llu MiB, heap trims gave %llu MiB; longest wait %u ms; "
+                 "clears so far %llu\n",
+                 MemoryWait::jit_reclaim_mode.load(std::memory_order_relaxed), waits,
+                 c.served_at_once.load(std::memory_order_relaxed), c.served_later.load(std::memory_order_relaxed),
+                 c.cleared.load(std::memory_order_relaxed), c.after_clear.load(std::memory_order_relaxed),
+                 c.ended.load(std::memory_order_relaxed), c.clear_capped.load(std::memory_order_relaxed),
+                 c.would_clear.load(std::memory_order_relaxed), reclaims,
+                 c.reclaim_scans.load(std::memory_order_relaxed), c.reclaim_skipped.load(std::memory_order_relaxed), busy,
+                 c.reclaim_bytes.load(std::memory_order_relaxed) >> 20, c.trim_bytes.load(std::memory_order_relaxed) >> 20,
+                 c.longest_ms.load(std::memory_order_relaxed), MemoryWait::jit_clears.load(std::memory_order_relaxed));
+}
+// EDEN_UP_HEAP_STEAL (headless/heap_arenas.inc, eden_heap_steal): from RefreshFreeMemory (every 100 ms
+// at most) while it is on. Its counters every 10 s, when one has moved.
+// EDEN_UP_HEAP_STEAL_TABLE=1 (off unless set; with EDEN_MEMORY_REPORT_THREAD=1, else no table: it asks
+// every arena, too long for the GPU thread): at the first request about to be refused, and then once in
+// 30 s at most, the heap's table is queued for the MemoryReport thread. Its own switch because the table
+// measures room by taking it (eden_heap_room) and holds the creation lock record by record, so it can
+// refuse other threads at the brink: keep it off in both arms of an off-against-count comparison.
+static bool HeapStealTable() {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_UP_HEAP_STEAL_TABLE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return on;
+}
+static void ReportHeapSteal(long long now, int mode) {
+    constexpr unsigned kStats = 29;
+    unsigned long long v[kStats] = {};
+    if (eden_heap_steal_stats(v, kStats) < kStats) return;
+    static std::atomic<unsigned long long> tabled_triggers{0};
+    static std::atomic<long long> tabled_ns{0};
+    if (HeapStealTable() && v[0] != tabled_triggers.load(std::memory_order_relaxed)) {
+        tabled_triggers.store(v[0], std::memory_order_relaxed);
+        long long last = tabled_ns.load(std::memory_order_relaxed);
+        if (OffThreadReportsEnabled() && (last == 0 || now - last >= 30'000'000'000) &&
+            tabled_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
+            QueueOffThreadReport(false, false, {}, true);
+    }
+    static std::atomic<long long> reported_ns{0};
+    static std::atomic<unsigned long long> reported_sum{0};
+    long long last = reported_ns.load(std::memory_order_relaxed);
+    if (last == 0) {
+        reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000) return;
+    // Moved: the triggers, what was served or missed, the test's refusals, and the v2 counters.
+    unsigned long long sum = 0;
+    for (unsigned i = 0; i <= 16; ++i) sum += v[i];
+    sum += v[24] + v[25] + v[26] + v[27];
+    if (sum == reported_sum.load(std::memory_order_relaxed) ||
+        !reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
+        return;
+    reported_sum.store(sum, std::memory_order_relaxed);
+    char fewest[24] = "-";  // no scan yet
+    if (v[20] != 0) std::snprintf(fewest, sizeof(fewest), "%llu", v[20] - 1);
+    std::fprintf(stderr,
+                 "EDEN_UP_HEAP_STEAL mode=%d triggers %llu at a refusal / %llu before a growth; scans %llu; served %llu "
+                 "(last arena %llu, empty %llu, partly used %llu; %llu MiB; from spares %llu, kept on the asking thread's "
+                 "record %llu), moved to the asking thread %llu (kept as a record's first %llu), none found %llu; last "
+                 "arena dropped, a thread is on it %llu; not asked: too big %llu, lock held by this thread %llu, lock "
+                 "busy after the wait %llu, lock busy without a wait %llu, after a miss of that size or less %llu, count "
+                 "mode within 100 ms %llu; count mode would have served %llu of %llu scans; at the last scan %llu empty "
+                 "arenas no thread is on (fewest %s), %llu partly used, %llu spaces of idle arenas only (%llu MiB), %llu "
+                 "looked up the slow way; time %llu ms, longest %llu us; test refusals %llu\n",
+                 mode, v[0], v[1], v[2], v[3] + v[4] + v[5], v[3], v[4], v[5], v[6] >> 20, v[7], v[26], v[8], v[9],
+                 v[10], v[27], v[11], v[12], v[13], v[25], v[14], v[15], v[16], v[2], v[19], fewest, v[21], v[22],
+                 v[23], v[28], v[17] / 1000, v[18], v[24]);
 }
 // The largest free block of direct memory is what the next graphics allocation needs. Looked at
 // again every 100 ms; called on the GPU thread by the texture collector (KeepDirtyTextures).
@@ -887,6 +1110,19 @@ static void RefreshFreeMemory() {
             WriteMemorySummary(largest, view.short_memory);
         }
     }
+    // EDEN_UP_RADV_OOM_LEND: its counters every 10 s while it is on (and its first use, before the
+    // driver's callback needs it).
+    if (const long long lend = ::Common::LiveSwitch::Value<::Common::LiveSwitch::Id::RadvOomLend>(); lend != 0)
+        ReportRadvOomLend(now, lend);
+    // EDEN_UP_HEAP_STEAL: the table at the heap's brink, and its counters every 10 s.
+    if (eden_heap_steal_mode_now && eden_heap_steal_stats)
+        if (const int steal = eden_heap_steal_mode_now(); steal != 0) ReportHeapSteal(now, steal);
+    // EDEN_UP_NEW_WAIT_MS: the new handler's waits, every 10 s while it is on.
+    if (Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed) != 0) ReportNewWait(now);
+    // EDEN_UP_JIT_COMMIT_AHEAD / EDEN_TEST_JIT_COMMIT_REFUSE: their counters every 10 s while either is set.
+    if (eden_jit_ahead_active && eden_jit_ahead_stats && eden_jit_ahead_active() != 0) ReportJitAhead(now);
+    // EDEN_UP_JIT_COMMIT_RECLAIM: the JIT code cache's waits, every 10 s while it is on.
+    if (Eden::MemoryWait::jit_reclaim_mode.load(std::memory_order_relaxed) != 0) ReportJitReclaim(now);
     // The last burst of a session falls between two reports of the guest's memory (every 30 s):
     // who wrote it, while the pool's largest block is nearly gone (every 5 s at most).
     static std::atomic<long long> burst_ns{0};
@@ -1829,6 +2065,29 @@ extern "C" void eden_jit_compile(unsigned core, unsigned long long ns) {
     Eden::Performance::compilation[core].calls.fetch_add(1, std::memory_order_relaxed);
     Eden::Performance::compilation[core].nanoseconds.fetch_add(ns, std::memory_order_relaxed);
 }
+// EDEN_UP_JIT_COMMIT_RECLAIM (headless/dynarmic/jit_impl.inc, weak there): 2 asks whether the switch is
+// on (each JIT's constructor, once); 1 opens the scope around GetBlock's EnsureMemoryCommitted, on the
+// compiling thread; 0 closes it and returns what the commit left there (memory_wait.h JitCommitResult).
+extern "C" int eden_jit_refuse_in_compile(void) __attribute__((weak)); // the shared test hook, <where> 4
+extern "C" int eden_jit_commit_scope(int op) {
+    namespace MemoryWait = Eden::MemoryWait;
+    // The scope also opens for EDEN_TEST_JIT_COMMIT_REFUSE's <where> 4 alone: with the switch at 0 nothing
+    // reads what the commit leaves there (0 always), so GetBlock goes on as before.
+    if (op == 2)
+        return MemoryWait::jit_reclaim_mode.load(std::memory_order_relaxed) != 0 ||
+                       (eden_jit_refuse_in_compile && eden_jit_refuse_in_compile() != 0)
+                   ? 1
+                   : 0;
+    if (op == 1) {
+        MemoryWait::SetJitClearScope(1);
+        MemoryWait::SetJitCommitResult(0);
+        return 0;
+    }
+    const int result = MemoryWait::JitCommitResult();
+    MemoryWait::SetJitClearScope(0);
+    MemoryWait::SetJitCommitResult(0);
+    return result;
+}
 
 #ifdef PS5_NATIVE
 // The driver found no memory for one of its buffers (tools/patch-radv-series/lead-mesh-22): give the
@@ -1837,19 +2096,87 @@ extern "C" void eden_jit_compile(unsigned core, unsigned long long ns) {
 // without this the session ended at vkEndCommandBuffer (Ocarina on 13.60, crash-20261108-222452).
 // Any thread, inside the driver: only memory work here, nothing that calls back into Vulkan.
 extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
+// EDEN_UP_RADV_OOM_LEND=<blocks> (src/guest_memory_service.inc): the reclaim without a list on the heap
+// and without a second scan in the same swap tick when the last found nothing cold, and the guest
+// reserve lent down to that many blocks under its floor. Death at the forest exit (05:37, T120): eleven
+// refusals of 1.4 to 15.3 MiB in about a second, each with 0 to 64 MiB given back, while the reserve sat
+// at its floor of 64 MiB that nothing here could reach.
+extern "C" std::size_t eden_guest_memory_reclaim_bounded(std::size_t want, int verify) __attribute__((weak));
+extern "C" std::size_t eden_guest_reserve_lend_quiet(std::size_t bytes, std::size_t below_floor) __attribute__((weak));
 extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
     static std::mutex one_at_a_time;
     const std::lock_guard lock{one_at_a_time};
     Eden::Performance::graphics_refusals.fetch_add(1, std::memory_order_relaxed);
+    // Live, read once per call (not a hot path); 0 is the code as it was.
+    const std::uint64_t lend =
+        static_cast<std::uint64_t>(::Common::LiveSwitch::Value<::Common::LiveSwitch::Id::RadvOomLend>());
     const std::uint64_t want = std::clamp<std::uint64_t>(bytes * 4, std::uint64_t{64} << 20, std::uint64_t{512} << 20);
     std::uint64_t freed = Eden::Performance::TrimHeap("the driver found no memory");
-    if (freed < bytes && eden_guest_memory_reclaim)
+    if (lend != 0 && eden_guest_memory_reclaim_bounded) {
+        static const bool verify = Common::PeSwitch("EDEN_UP_RADV_OOM_LEND_VERIFY");
+        if (freed < bytes)
+            freed += eden_guest_memory_reclaim_bounded(static_cast<std::size_t>(want), verify ? 1 : 0);
+    } else if (freed < bytes && eden_guest_memory_reclaim) {
         freed += eden_guest_memory_reclaim(static_cast<std::size_t>(want));
+    }
+    // The driver asks once more, for one range of `bytes` or in 2 MiB pieces: the asked size rounded up
+    // to 2 MiB and one block more, less what already went back.
+    std::uint64_t lent = 0;
+    if (lend != 0) {
+        constexpr std::uint64_t block = std::uint64_t{2} << 20;
+        const std::uint64_t rounded = (bytes + block - 1) & ~(block - 1);
+        if (freed < bytes && freed < rounded + block && eden_guest_reserve_lend_quiet) {
+            lent = eden_guest_reserve_lend_quiet(static_cast<std::size_t>(rounded + block - freed),
+                                                 static_cast<std::size_t>(lend));
+            freed += lent;
+        }
+        Eden::Performance::radv_oom_callbacks.fetch_add(1, std::memory_order_relaxed);
+        Eden::Performance::radv_oom_lent.fetch_add(lent, std::memory_order_relaxed);
+        (freed >= rounded ? Eden::Performance::radv_oom_covered : Eden::Performance::radv_oom_short)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
     static std::atomic<unsigned> logged{0};
-    if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
-        std::fprintf(stderr, "EDEN_RADV_OUT_OF_MEMORY %llu KiB asked: %llu MiB given back\n",
-                     static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(freed >> 20));
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        if (lend != 0)
+            std::fprintf(stderr,
+                         "EDEN_RADV_OUT_OF_MEMORY %llu KiB asked: %llu MiB given back, lent %llu MiB of the guest "
+                         "reserve (down to %llu blocks under its floor)\n",
+                         static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(freed >> 20),
+                         static_cast<unsigned long long>(lent >> 20), static_cast<unsigned long long>(lend));
+        else
+            std::fprintf(stderr, "EDEN_RADV_OUT_OF_MEMORY %llu KiB asked: %llu MiB given back\n",
+                         static_cast<unsigned long long>(bytes >> 10), static_cast<unsigned long long>(freed >> 20));
+    }
     return freed;
+}
+#endif
+
+#ifdef PS5_NATIVE
+extern "C" std::int64_t sceKernelGetDirectMemorySize();
+extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
+                                                           std::size_t*);
+// The largest free block of the pool in bytes, 0 when unknown, looked at again every 20 ms at most:
+// pipeline builds ask it before they start (core patch 0554, waveydude's 0915,
+// EDEN_PIPELINE_MEMORY_GATE_MIB), from any builder thread. Only the kernel query and two atomics:
+// no lock, no allocation, no log. Asked only while the gate is on. From waveydude/Eglantine-PS5-
+// commit b9f52d98e8; changed: a known empty pool reads as 1 byte, not 0.
+extern "C" unsigned long long eden_pool_largest_free(void) {
+    static std::atomic<long long> checked_ns{0};
+    static std::atomic<unsigned long long> largest_seen{0};
+    const long long now = ::Eden::Performance::NowNs();
+    const long long last = checked_ns.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < 20'000'000) return largest_seen.load(std::memory_order_relaxed);
+    checked_ns.store(now, std::memory_order_relaxed);
+    std::int64_t start = 0;
+    std::size_t largest = 0;
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    // 0 tells the gate "unknown" and it never waits; an empty pool is the case it is for, so a
+    // known largest block of 0 is given as 1 byte (not in waveydude's text). A failed query stays 0.
+    const bool known =
+        total > 0 && sceKernelAvailableDirectMemorySize(0, total, 0x4000, &start, &largest) == 0;
+    const unsigned long long value = known ? std::max<unsigned long long>(largest, 1) : 0;
+    largest_seen.store(value, std::memory_order_relaxed);
+    return value;
 }
 #endif
 

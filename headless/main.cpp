@@ -26,6 +26,7 @@
 #include <cstring>
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
+extern "C" size_t eden_heap_trim(void) __attribute__((weak));
 // headless/heap_pages.cpp (the native build only): the pool switches, read once env.txt is in.
 extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 #endif
@@ -67,6 +68,7 @@ extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 #include "extracted_game.h"
 #include "cache_budget.h"
 #include "performance.h"
+#include "memory_wait.h"
 #include "crash_site.h"
 #include "core/memory.h"
 #include "video_core/dma_pusher.h"
@@ -261,6 +263,21 @@ static void UpdateGrips(Core::System& system, Eden::Pad& pad) {
     }
 }
 
+// T130: a NAME=VALUE line of env.txt or env-<title id>.txt as the reader takes it. A file saved on
+// Windows ends each line in a carriage return, and most switches count only an exact "1", so
+// "EDEN_UP_X=1\r" was silently off. Trailing carriage returns, spaces and tabs (the end of the
+// value) and spaces and tabs before the name go; a line without them is left exactly as it is.
+// True when something was trimmed (counted for the EDEN_ENV_TRIM line).
+inline bool TrimEnvLine(std::string& line) {
+    std::size_t end = line.size();
+    while (end != 0 && (line[end - 1] == '\r' || line[end - 1] == ' ' || line[end - 1] == '\t')) --end;
+    std::size_t begin = 0;
+    while (begin < end && (line[begin] == ' ' || line[begin] == '\t')) ++begin;
+    if (begin == 0 && end == line.size()) return false;
+    line = line.substr(begin, end - begin);
+    return true;
+}
+
 int main(int argc, char** argv) {
     try {
         std::FILE* report = stdout;
@@ -339,6 +356,84 @@ int main(int argc, char** argv) {
             unsigned reason = 0;
             size_t count = 0;
             const size_t bytes = eden_heap_last_failure(&reason, &count);
+            // EDEN_UP_NEW_WAIT_MS=<ms> (memory_wait.h; unset or 0: no wait, as before). operator new
+            // calls this after each refusal and tries again when it returns, so returning after a
+            // 20 ms sleep is the wait: other threads free memory meanwhile (an area's pages and
+            // textures go as the next one's arrive). The heap's empty spaces go back at the start
+            // and every 500 ms. One EDEN_NEW_WAIT line when a wait starts; a wait that is served
+            // prints nothing more, one that runs out prints the failure below and throws, and the
+            // thread's failures of the next 30 s throw at once (memory_wait.h: CooldownMs).
+            // Port: the whole block runs only with the switch on; off, the handler is the old one.
+            // Counters for the EDEN_UP_NEW_WAIT line every 10 s (headless/performance.cpp).
+            if (const unsigned wait_ms = Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed);
+                wait_ms != 0) {
+                namespace MemoryWait = Eden::MemoryWait;
+                auto& counters = MemoryWait::counters;
+                thread_local MemoryWait::Episode episode;
+                // T130 (review of the port): the time this thread really slept in its current wait
+                // (20 ms per step, from its Start), for "longest" and to tell an at-once give-up
+                // from a wait that ran out.
+                thread_local std::uint64_t episode_asleep_ms = 0;
+                const bool worth = MemoryWait::WorthWaitingFor(bytes);
+                const unsigned limit = worth ? wait_ms : 0;
+                const auto now = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count());
+                const bool was_open = episode.active;
+                const std::uint64_t last_call = episode.last_ms;
+                const bool in_cooldown = now < episode.cooldown_until_ms;
+                const MemoryWait::Step step = MemoryWait::Next(episode, now, limit, bytes);
+                if (step != MemoryWait::Step::GiveUp) {
+                    if (step == MemoryWait::Step::Start) {
+                        episode_asleep_ms = 0;
+                        counters.begun.fetch_add(1, std::memory_order_relaxed);
+                        if (was_open && now - last_call <= MemoryWait::SameRequestGapMs)
+                            counters.other_size.fetch_add(1, std::memory_order_relaxed);
+                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u\n",
+                                     bytes, reason, limit);
+                    }
+                    if (MemoryWait::TrimNow(episode, step, now) && eden_heap_trim) {
+                        counters.trims.fetch_add(1, std::memory_order_relaxed);
+                        eden_heap_trim();
+                    }
+                    counters.steps.fetch_add(1, std::memory_order_relaxed);
+                    counters.waiting.fetch_add(1, std::memory_order_relaxed);
+                    usleep(20000);
+                    counters.waiting.fetch_sub(1, std::memory_order_relaxed);
+                    episode_asleep_ms += 20;
+                    MemoryWait::NoteLongest(episode_asleep_ms);
+                    return;
+                }
+                if (!worth) {
+                    counters.too_big.fetch_add(1, std::memory_order_relaxed);
+                } else if (episode.cooldown_until_ms == now + MemoryWait::CooldownMs && !in_cooldown &&
+                           now - last_call > MemoryWait::try_bound_ms.load(std::memory_order_relaxed)) {
+                    // His 60 s same-size rule joined this refusal to the wait before it, and the pause
+                    // since that wait's last step is longer than one try can take here (the heap's own
+                    // longest wait plus EpisodeGapMs: memory_wait.h, try_bound_ms). So that wait was
+                    // served and the same size is refused again; its limit is spent by the clock, not
+                    // by sleeping. No wait now, his 30 s cooldown follows. Counted apart, not as
+                    // "gave up".
+                    counters.at_once.fetch_add(1, std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "EDEN_NEW_WAIT refused at once: the same size again %llu ms after this thread's "
+                                 "last wait step (within 60 s), its wait slept %llu ms of %u; no waits on this "
+                                 "thread for %llu s\n",
+                                 static_cast<unsigned long long>(now - last_call),
+                                 static_cast<unsigned long long>(episode_asleep_ms), limit,
+                                 static_cast<unsigned long long>(MemoryWait::CooldownMs / 1000));
+                } else if (episode.cooldown_until_ms == now + MemoryWait::CooldownMs && !in_cooldown) {
+                    // A line for a wait that ran out, not for the refusals of the cooldown after it.
+                    counters.gave_up.fetch_add(1, std::memory_order_relaxed);
+                    std::fprintf(stderr, "EDEN_NEW_WAIT gave up after %u ms (slept %llu ms); no waits on this "
+                                 "thread for %llu s\n",
+                                 limit, static_cast<unsigned long long>(episode_asleep_ms),
+                                 static_cast<unsigned long long>(MemoryWait::CooldownMs / 1000));
+                } else {
+                    counters.cooldown.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu\n", bytes,
                          reason, count);
             ps5_opengl_heap_snapshot("allocation_failure", 0);
@@ -538,12 +633,20 @@ int main(int argc, char** argv) {
             // Development: env.txt in the app folder sets core switches (NAME=VALUE per line,
             // e.g. EDEN_NX2_GPU_PROFILE=1) before the core reads them. Absent in a release.
             std::ifstream environment(Eden::AppFile("env.txt"));
+            unsigned lines = 0, trimmed = 0;
             for (std::string entry; std::getline(environment, entry);) {
+                ++lines;
+                if (TrimEnvLine(entry)) ++trimmed;
                 const auto split = entry.find('=');
                 if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
                 setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
                 std::printf("EDEN_ENV %s\n", entry.c_str());
             }
+            // One line whenever the file is there: how many of its lines had a carriage return,
+            // spaces or tabs trimmed (0 for a file saved with plain line ends).
+            if (environment.is_open() || lines != 0)
+                std::printf("EDEN_ENV_TRIM env.txt: %u of %u lines trimmed (a carriage return, spaces or tabs at "
+                            "the end, or spaces before the name)\n", trimmed, lines);
         }
         // EDEN_THREAD_DUMP=1: every named thread's place on a freeze (no frame for 3, 10 and 60 s
         // in a game) or when dump-threads.txt is dropped into the app folder (crash_report.h).
@@ -806,13 +909,54 @@ int main(int argc, char** argv) {
             std::snprintf(title_environment, sizeof(title_environment), "env-%016llx.txt",
                           static_cast<unsigned long long>(game_title));
             std::ifstream environment(Eden::AppFile(title_environment));
+            unsigned lines = 0, trimmed = 0;
             for (std::string entry; std::getline(environment, entry);) {
+                ++lines;
+                if (TrimEnvLine(entry)) ++trimmed;
                 const auto split = entry.find('=');
                 if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
                 setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
                 std::printf("EDEN_ENV_TITLE %s\n", entry.c_str());
             }
+            if (trimmed != 0)
+                std::printf("EDEN_ENV_TRIM %s: %u of %u lines trimmed\n", title_environment, trimmed, lines);
         }
+        // EDEN_UP_NEW_WAIT_MS (memory_wait.h): read with env.txt and this game's own env file in.
+        // 0 until here, so nothing in the launcher waits.
+        // T130: the longest one try of a request can take here, the heap's own waits
+        // (EDEN_UP_HEAP_WAIT_MS on builder threads, _GPU_MS in run-time builds; heap_pages.cpp) plus
+        // EpisodeGapMs: a same-size refusal after a longer pause comes after a served wait.
+        Eden::MemoryWait::try_bound_ms.store(
+            static_cast<unsigned>(Eden::MemoryWait::EpisodeGapMs) +
+                std::max(Eden::MemoryWait::ReadMs("EDEN_UP_HEAP_WAIT_MS", 0, 0, 60000),
+                         Eden::MemoryWait::ReadMs("EDEN_UP_HEAP_WAIT_GPU_MS", 0, 0, 5000)),
+            std::memory_order_relaxed);
+        Eden::MemoryWait::new_wait_ms.store(Eden::MemoryWait::ReadMs("EDEN_UP_NEW_WAIT_MS", 0, 0, 60000),
+                                            std::memory_order_relaxed);
+        if (const unsigned wait = Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed)) {
+            std::printf("EDEN_UP_NEW_WAIT_MS=%u: operator new waits that long for memory before it gives up\n",
+                        wait);
+        }
+        // T132 EDEN_UP_JIT_COMMIT_RECLAIM (memory_wait.h): 0 until here, so the launcher's JIT (if any)
+        // keeps the old wait; above 3 reads as 3.
+        Eden::MemoryWait::jit_reclaim_mode.store(Eden::MemoryWait::ReadMs("EDEN_UP_JIT_COMMIT_RECLAIM", 0, 0, 3),
+                                                 std::memory_order_relaxed);
+        if (const unsigned reclaim = Eden::MemoryWait::jit_reclaim_mode.load(std::memory_order_relaxed)) {
+            std::printf("EDEN_UP_JIT_COMMIT_RECLAIM=%u: a refused JIT code cache step %s\n", reclaim,
+                        reclaim == 1 ? "waits as before, counted"
+                        : reclaim == 2 ? "packs cold guest memory every 100 ms of its wait and asks again at once"
+                                       : "packs cold guest memory and asks again; at the limit inside a block compile "
+                                         "the compiled code is cleared instead of ending the session");
+        }
+        // The other two waits are read where they run (their first wait); say here when they are set.
+        if (const unsigned jit = Eden::MemoryWait::ReadMs2("EDEN_UP_JIT_COMMIT_WAIT_MS", "EDEN_JIT_COMMIT_WAIT_MS", 2000,
+                                                           20, 60000);
+            jit != 2000)
+            std::printf("EDEN_UP_JIT_COMMIT_WAIT_MS=%u: the JIT code cache waits that long for memory\n", jit);
+        if (const unsigned write = Eden::MemoryWait::ReadMs2("EDEN_UP_GUEST_WRITE_WAIT_MS", "EDEN_GUEST_WRITE_WAIT_MS",
+                                                             2000, 20, 60000);
+            write != 2000)
+            std::printf("EDEN_UP_GUEST_WRITE_WAIT_MS=%u: a guest write waits that long for a block\n", write);
 #ifndef EDEN_DEV_PROFILE
         // EDEN_UP_LEAN_DEV_TIMERS=1: the six timers only a development profile build reports
         // (performance.h, DevTotals) stop reading the clock. Read here, with env.txt and this game's

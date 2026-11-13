@@ -82,6 +82,16 @@
                 // per-image drain, one GPU pipeline wait each, where this loop would have spent
                 // a single wait on all of them. Skip them and keep looking.
                 if (!dirty || image.unswizzled_size_bytes > kBatchBytes - bytes) return false;
+                // EDEN_UP_GC_WRITEBACK_SKIP=1: Cleanup leaves an image whose write-back would grow
+                // the swizzle scratch (texture_cache.h). Its copy would be thrown away, and while it
+                // sat in the batch TakePrefetched could start no new one. The scratch only grows
+                // during the pass, so an image copied here is never one Cleanup then leaves.
+                if (Common::LiveSwitch::Peek<Common::LiveSwitch::Id::GcWritebackSkip>() != 0 &&
+                    !gc_writeback_verify &&
+                    WritebackNeedsHeap(*gpu_memory, image.gpu_addr, image.info,
+                                       swizzle_data_buffer.capacity())) [[unlikely]] {
+                    return false;
+                }
                 // Aliased, overlapping and MSAA images stay with Cleanup: their copies are not
                 // independent of the state that eviction updates. A scaled image is copied here
                 // as Cleanup copies it, by the same call (it is scaled down for the copy): at a

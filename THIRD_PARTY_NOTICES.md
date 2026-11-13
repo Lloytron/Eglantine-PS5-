@@ -21,6 +21,10 @@ builds on the following projects, each under its own license.
   and from heydemoura/EglantinePS5, native MME dispatch (`headless/macro_native*`,
   `tools/check-macro-native*`, 9206f0adf9, adapted from ProsperoEden; instruction streams appear
   only as SHA-256 signatures).
+- **[EglantinePS5 (heydemoura)](https://github.com/heydemoura/EglantinePS5)**, GPL-3.0-or-later.
+  a8535be816 (PR #94): unencrypted games start without keys or firmware
+  (`headless/eglantineps5/eden_services.cpp`, `pe/ui/launcher.cpp`, `pe/ui/services.hpp`,
+  `pe/ui/settings.cpp`, host preview), changed here to apply only when both are absent.
 - **[Zortos Eglantine fork](https://github.com/zortos293/Eglantine)**,
   GPL-3.0-or-later. Referenced directly by the `Eglantine` submodule, including its
   core, native shader, readback, service, runtime and test changes. The maintained

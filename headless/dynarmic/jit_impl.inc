@@ -1,4 +1,8 @@
 extern "C" void mkw_native_block(unsigned long long, const void*, unsigned long long);
+// EDEN_UP_JIT_COMMIT_RECLAIM (headless/memory_wait.h, performance.cpp): 2 asks whether the switch is on
+// (once, in the constructor); 1 opens and 0 closes the scope around GetBlock's commit, 0 returning what
+// the commit left (0 served, 1 refused: clear, 2 another core cleared meanwhile). Absent: off.
+extern "C" int eden_jit_commit_scope(int op) __attribute__((weak));
 // EglantinePS5: Jit::Impl with one compiled-code namespace per guest process (inserted into
 // a64_interface.cpp in place of upstream's Impl; see headless/dynarmic/jit_group.h).
 //
@@ -47,6 +51,7 @@ public:
         }
         eden_space.store(block_of_code.SpaceRemaining(), std::memory_order_relaxed);
         EdenInitState();
+        eden_commit_clear = eden_jit_commit_scope != nullptr && eden_jit_commit_scope(2) != 0;
     }
 
     ~Impl() {
@@ -293,11 +298,31 @@ private:
                 EdenClearGroup();
                 continue;
             }
+            // EDEN_UP_JIT_SITE_SHARDS 10 s line; no lock held here. The clock (the TSC on the PS5) is
+            // read only with the switch on, once per compile, outside the group lock.
+            if (JitGroup::SiteShardMode() != 0)
+                JitGroup::LogSiteShards(static_cast<long long>(EdenClockNs()));
             // Held until the block is published: a precompilation uses the same emitter.
             eden_compile_waiters.fetch_add(1, std::memory_order_seq_cst);
-            std::lock_guard compiling{eden_compile_mutex};
+            std::unique_lock compiling{eden_compile_mutex};
             eden_compile_waiters.fetch_sub(1, std::memory_order_seq_cst);
+            if (eden_commit_clear)
+                (void)eden_jit_commit_scope(1);
             block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
+            // EDEN_UP_JIT_COMMIT_RECLAIM=3: the code cache's next part found no memory in the whole wait
+            // (1), so every region starts again at its beginning, in memory it already has: the same
+            // clear as a full region (state Lookup here, so no member waits for this core). 2: another
+            // core's clear reset this region meanwhile: compile again. Nothing was emitted yet.
+            if (eden_commit_clear) {
+                if (const int refused = eden_jit_commit_scope(0); refused != 0) {
+                    compiling.unlock();
+                    if (refused == 1) {
+                        EdenReportPressure();
+                        EdenClearGroup();
+                    }
+                    continue;
+                }
+            }
 
             const u32 previous = eden_state.exchange(EdenCompiling, std::memory_order_seq_cst);
             if (group->clearing.load(std::memory_order_seq_cst)) {
@@ -586,6 +611,7 @@ private:
     std::atomic<u32> eden_state{EdenOutside};
     std::mutex eden_compile_mutex;
     std::atomic<u32> eden_compile_waiters{0};
+    bool eden_commit_clear = false;  // EDEN_UP_JIT_COMMIT_RECLAIM is not 0 (read in the constructor)
     std::atomic<u32> eden_pre_state{EdenOutside};
     std::atomic<std::size_t> eden_space{0};
     std::atomic<bool> eden_flush{false};

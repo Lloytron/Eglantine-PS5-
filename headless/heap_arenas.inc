@@ -324,6 +324,11 @@ struct eden_heap_thread {
   unsigned retry; /* requests to make before looking through `own` again (EDEN_HEAP_ARENA_RETRY) */
   unsigned grown; /* pieces the heap took for this record's requests */
   char name[16];  /* what the thread on this record called itself, for the reports */
+  /* EDEN_UP_HEAP_STEAL: 1 + the index in eden_heap_arena_list of the arena this thread's last
+   * request about to be refused was served from (0: none); asked first next time, under the creation
+   * lock. Its own thread's only; cleared when a thread claims the record. It sits in the 4 bytes of
+   * padding before `live`, so no field moves and the record keeps its size. */
+  unsigned steal;
   long live;
   long blocks;
   unsigned pending;
@@ -819,6 +824,42 @@ static void eden_heap_grow_acquire(void) {
   }
 }
 
+/* EDEN_UP_HEAP_STEAL (eden_heap_steal, after eden_heap_arena_rescue): its mode, 0 off. */
+static atomic_int eden_heap_steal_mode;
+/* Mode 3: the process time (us, | 1) at which the pool last refused a growth; eden_heap_main asks
+ * the idle arenas before the pool for EDEN_HEAP_STEAL_BEFORE_GROW_US after it. Written only while
+ * the mode is 3. */
+static atomic_ullong eden_heap_steal_pool_no_us;
+#define EDEN_HEAP_STEAL_BEFORE_GROW_US 1000000ull
+/* EDEN_TEST_HEAP_NO_GROW=<every>[,<after_s>] (a test, off unless set): from <after_s> seconds after
+ * main read it, every <every>-th growth of the heap is refused as if the pool had no memory (reason
+ * 2, "the console has no memory for a new piece"), so the heap's brink is reached on any route
+ * without taking memory away from anyone. Without EDEN_UP_HEAP_STEAL a refused growth fails its
+ * request, as a real one does. */
+static atomic_uint eden_heap_no_grow_every;
+static atomic_ullong eden_heap_no_grow_from_us, eden_heap_no_grow_seen, eden_heap_no_grow_refused;
+uint64_t sceKernelGetProcessTime(void);
+
+static int eden_heap_test_no_grow(void) {
+  const unsigned every = atomic_load_explicit(&eden_heap_no_grow_every, memory_order_relaxed);
+  if (every == 0)
+    return 0;
+  const unsigned long long from = atomic_load_explicit(&eden_heap_no_grow_from_us, memory_order_relaxed);
+  if (from != 0 && (unsigned long long)sceKernelGetProcessTime() < from)
+    return 0;
+  if ((atomic_fetch_add_explicit(&eden_heap_no_grow_seen, 1, memory_order_relaxed) + 1) % every != 0)
+    return 0;
+  atomic_fetch_add_explicit(&eden_heap_no_grow_refused, 1, memory_order_relaxed);
+  return 1;
+}
+
+void eden_heap_set_no_grow(unsigned every, unsigned after_s) {
+  atomic_store_explicit(&eden_heap_no_grow_from_us,
+                        after_s != 0 ? (unsigned long long)sceKernelGetProcessTime() + (unsigned long long)after_s * 1000000ull : 0,
+                        memory_order_relaxed);
+  atomic_store_explicit(&eden_heap_no_grow_every, every, memory_order_relaxed);
+}
+
 /* What made the heap grow: the pieces each kind of request took, and the largest of them. */
 enum {
   EDEN_HEAP_GREW_ARENA, EDEN_HEAP_GREW_SMALL, EDEN_HEAP_GREW_1M, EDEN_HEAP_GREW_8M, EDEN_HEAP_GREW_32M,
@@ -890,7 +931,7 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
              (first < used || pieces <= EDEN_HEAP_PIECES - used)) {
     void *start = (char *)ps5_heap_base + ((size_t)first << EDEN_HEAP_PIECE_SHIFT);
     const size_t size = pieces << EDEN_HEAP_PIECE_SHIFT;
-    if (eden_heap_commit(start, size) == 0) {
+    if (!eden_heap_test_no_grow() && eden_heap_commit(start, size) == 0) {
       void *space = sceLibcMspaceCreate("Eden-heap", start, size, 0);
       atomic_fetch_add_explicit(&eden_heap_committed_bytes, size, memory_order_relaxed);
       if (first == used)
@@ -914,6 +955,9 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
           atomic_store_explicit(&eden_heap_space_retired[slot], 0, memory_order_seq_cst);
         atomic_fetch_add_explicit(&eden_heap_space_generation, 1, memory_order_release);
         eden_heap_note_growth(bytes, (unsigned)pieces);
+        /* EDEN_UP_HEAP_STEAL mode 3: the pool gave again, so growth comes before the idle arenas. */
+        if (atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed) >= 3)
+          atomic_store_explicit(&eden_heap_steal_pool_no_us, 0, memory_order_relaxed);
         grown = 1;
       } else {
         /* The memory stays committed but no space is over it: given back at once. */
@@ -927,6 +971,9 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
       }
     } else {
       atomic_store_explicit(&eden_heap_grow_why, EDEN_HEAP_WHY_NO_MEMORY, memory_order_relaxed);
+      if (atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed) >= 3)
+        atomic_store_explicit(&eden_heap_steal_pool_no_us, (unsigned long long)sceKernelGetProcessTime() | 1u,
+                              memory_order_relaxed);
       eden_heap_grow_refused("EDEN_HEAP_GROW refused: the console has no memory for a new piece\n");
     }
   } else {
@@ -1004,9 +1051,25 @@ static void *eden_heap_space_use(unsigned slot, int kind, size_t a, size_t b) {
   return address;
 }
 
+/* EDEN_UP_HEAP_STEAL (after eden_heap_arena_rescue): a block from an arena no thread is on, for a
+ * request the heap could not grow for (`before_grow` 0), or, in mode 3, one it is about to grow for
+ * while the pool keeps refusing (1). NULL: off, or nothing found. Cold and not inlined, so
+ * eden_heap_main keeps its code layout. */
+static void *eden_heap_steal(int kind, size_t a, size_t b, size_t bytes, int before_grow)
+    __attribute__((cold, noinline));
+
+/* Mode 3: the pool refused a growth less than EDEN_HEAP_STEAL_BEFORE_GROW_US ago. */
+static int eden_heap_steal_before_grow_due(void) {
+  if (atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed) < 3)
+    return 0;
+  const unsigned long long refused = atomic_load_explicit(&eden_heap_steal_pool_no_us, memory_order_relaxed);
+  return refused != 0 && (unsigned long long)sceKernelGetProcessTime() - refused < EDEN_HEAP_STEAL_BEFORE_GROW_US;
+}
+
 static void *eden_heap_main(int kind, size_t a, size_t b) {
   const size_t bytes = kind == EDEN_HEAP_MALLOC ? a : kind == EDEN_HEAP_CALLOC ? a * b : a + b;
   unsigned wanted = eden_heap_request_class(bytes);
+  int stole_before_grow = 0;
   for (;;) {
     const unsigned generation = atomic_load_explicit(&eden_heap_space_generation, memory_order_acquire);
     const unsigned count = atomic_load_explicit(&eden_heap_space_count, memory_order_acquire);
@@ -1029,9 +1092,17 @@ static void *eden_heap_main(int kind, size_t a, size_t b) {
     }
     if (bytes == 0)
       return NULL;
+    if (!stole_before_grow && eden_heap_steal_before_grow_due()) {
+      stole_before_grow = 1;
+      void *address = eden_heap_steal(kind, a, b, bytes, 1);
+      if (address != NULL)
+        return address;
+    }
     if (!eden_heap_grow(bytes, generation)) {
       if (!passed_over)
-        return NULL;
+        return atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed) != 0
+                   ? eden_heap_steal(kind, a, b, bytes, 0)
+                   : NULL;
       wanted = EDEN_HEAP_CLASS_ANY;
     }
   }
@@ -1179,6 +1250,7 @@ static struct eden_heap_thread *eden_heap_self(void) {
     self->blocks = 0;
     self->pending = 0;
     self->retry = 0;  /* its arenas (own) stay: this thread uses them */
+    self->steal = 0;  /* EDEN_UP_HEAP_STEAL: the last thread's hint is not this one's */
     __atomic_store_n(&self->name[0], 0, __ATOMIC_RELAXED);
     if (pthread_setspecific(eden_heap_arena_key, self) != 0) {
       atomic_store_explicit(&eden_heap_thread_used[i], 0, memory_order_release);
@@ -1854,8 +1926,11 @@ void eden_heap_arena_report(void) {
  * use, 372 MiB of that in whole free 2 MiB pages, while 968 requests of 280 to 750 KiB failed and
  * the driver's shader compiler, which does not check its allocations, ended the session. An arena
  * serves any thread (mspaces take their own locks, and a block finds its arena by its address), so
- * the block is freed like any other. Up to 4 MiB: an arena is 8 MiB. Under the creation lock, as
- * every walk of the arena list. */
+ * the block is freed like any other. Up to 4 MiB: written when an arena was 8 MiB; arenas are 2 MiB
+ * now (EDEN_HEAP_ARENA_SHIFT), so a request over about 2 MiB is asked of every arena and none can
+ * take it. Under the creation lock, as every walk of the arena list. It skips spares, and asks
+ * every arena with an mspace call each: EDEN_UP_HEAP_STEAL (below) asks the empty ones first, the
+ * spares among them, with a bounded number of calls. */
 #define EDEN_HEAP_RESCUE_MAX ((size_t)4 << 20)
 static atomic_int eden_heap_rescue_on;
 static atomic_uint eden_heap_rescue_next;
@@ -1889,6 +1964,457 @@ static void *eden_heap_arena_rescue(size_t count, size_t size, int zero) {
   }
   eden_heap_create_release();
   atomic_fetch_add_explicit(address != NULL ? &eden_heap_rescued : &eden_heap_rescue_missed, 1, memory_order_relaxed);
+  return address;
+}
+
+/* EDEN_UP_HEAP_STEAL=<mode> (off unless set; read from main in eden_heap_pool_init,
+ * headless/heap_pages.cpp). Two sessions of 11 Nov 2026 ended with the pool empty while the heap
+ * held 300 to 460 MiB of whole free 2 MiB pages: ours (T121, a 452 KiB request on am:1, std::bad_alloc)
+ * and a tester's (T120, 240 refused 160 KiB requests on the GPU thread). What was left of that room
+ * at the end was in arenas no thread was on, many of them empty (the tester's: 116 empty, 99 of them
+ * the pipeline builders'), and no request of those sizes ever asks such an arena: one of 64 KiB or
+ * more asks no arena but its own thread's (eden_heap_arena_allocate), one of 256 KiB or more none at
+ * all (eden_heap_allocate). An arena's room cannot go back to the pool (an arena is never freed: the
+ * top of this file), but any thread can take a block from it: mspaces take their own locks, and a
+ * block finds its arena by its address, so it is freed like any other arena block.
+ * Where eden_heap_main is about to return NULL because the heap could not grow:
+ *   1  count only: how many arenas no thread is on are empty and how many partly used, and how many
+ *      spaces hold nothing but empty arenas no thread is on (what a later step that gives whole
+ *      spaces back could return); the request still fails. One count every 100 ms at most, and only
+ *      when the creation lock is free at the first try (never a wait the off arm does not have).
+ *   2  serve it: the arena this thread was last served from (unless a thread is on it now), then up
+ *      to EDEN_HEAP_STEAL_EMPTY_TRIES empty arenas no thread is on (spares too), then up to
+ *      EDEN_HEAP_STEAL_PARTLY partly used ones. A spare that served moves to this thread's record
+ *      (kept, not used), or stays a spare. After a search for n bytes found nothing, the next
+ *      EDEN_HEAP_STEAL_MISS_US do not search for n bytes or more (a burst of refusals); smaller
+ *      requests still search, and the last arena is still asked.
+ *   3  2, and: a request under 256 KiB that an empty arena served moves that arena to this thread's
+ *      record and makes it the one it uses, so the next requests take the lock-free path (never a
+ *      record's first arena, never one a thread is on); and for 1 s after the pool refused a growth,
+ *      eden_heap_main asks here before it asks the pool again.
+ * Nothing is freed, merged, decommitted or given to the pool here.
+ * Locks: only the creation lock, taken with a try bounded in time (eden_heap_create_try: a busy lock
+ * is a miss, never a wait without end; mspace locks are waited on as on every other path), never by
+ * the thread that holds it, never for an arena's own block
+ * (eden_heap_create_arena_locked asks eden_heap_main under it), and never under the growth lock
+ * (eden_heap_main is not called under it). Under it: atomics, the records and the list, and at most
+ * one mspace call per arena tried, which takes that mspace's own lock and calls nothing of ours. No
+ * stdio and no wrapped malloc under it. The 10 s line: eden_heap_steal_stats, headless/performance.cpp. */
+#define EDEN_HEAP_STEAL_MAX ((size_t)EDEN_HEAP_ARENA_SIZE - ((size_t)64 << 10))
+#define EDEN_HEAP_STEAL_EMPTY_TRIES 8u
+#define EDEN_HEAP_STEAL_PARTLY 32u
+#define EDEN_HEAP_STEAL_MISS_US 5000ull
+#define EDEN_HEAP_STEAL_COUNT_US 100000ull
+/* The bounded tries of the creation lock, in process time (not in sleeps: how long a 50 us sleep
+ * really takes on the console is not measured): at a refusal (the request fails without it), and
+ * before a growth (the pool is still there to ask). The wait can pass the budget by one sleep. After
+ * a try that waited its budget and gave up, the next EDEN_HEAP_STEAL_BUSY_US try the lock once and
+ * never wait (count mode always does), so a burst of refusals while the lock is held long pays the
+ * wait at most once in that time. */
+#define EDEN_HEAP_STEAL_WAIT_REFUSAL_US 5000ull
+#define EDEN_HEAP_STEAL_WAIT_BEFORE_GROW_US 500ull
+#define EDEN_HEAP_STEAL_BUSY_US 20000ull
+enum {
+  EDEN_STEAL_TRIGGER_REFUSAL, EDEN_STEAL_TRIGGER_BEFORE_GROW, EDEN_STEAL_SCANS,
+  EDEN_STEAL_SERVED_STICKY, EDEN_STEAL_SERVED_EMPTY, EDEN_STEAL_SERVED_PARTLY, EDEN_STEAL_SERVED_BYTES,
+  EDEN_STEAL_FROM_SPARES, EDEN_STEAL_REHOMED, EDEN_STEAL_KEPT_FIRST, EDEN_STEAL_NONE,
+  EDEN_STEAL_TOO_BIG, EDEN_STEAL_LOCK_HELD, EDEN_STEAL_LOCK_BUSY, EDEN_STEAL_CACHED, EDEN_STEAL_RATE,
+  EDEN_STEAL_WOULD, EDEN_STEAL_TIME_US, EDEN_STEAL_LONGEST_US,
+  EDEN_STEAL_LAST_EMPTY, EDEN_STEAL_MIN_EMPTY_PLUS1, EDEN_STEAL_LAST_PARTLY, EDEN_STEAL_LAST_SPACES,
+  EDEN_STEAL_LAST_SPACE_MIB, EDEN_STEAL_TEST_REFUSED,
+  /* v2: lock busy on a try that did not wait (count mode, or within EDEN_HEAP_STEAL_BUSY_US of a
+   * busy give-up); served spares kept on the asking thread's record, not current; sticky arenas
+   * dropped because a thread is on them; at the last scan, the arenas threads are on whose mspace is
+   * not in its own slot (the slow look-up, NOTES 7.9). */
+  EDEN_STEAL_BUSY_NO_WAIT, EDEN_STEAL_SPARE_KEPT, EDEN_STEAL_STICKY_DROPPED, EDEN_STEAL_LAST_ODD,
+  EDEN_STEAL_STATS
+};
+static atomic_ullong eden_heap_steal_stat[EDEN_STEAL_STATS];
+static atomic_ullong eden_heap_steal_last_scan_us, eden_heap_steal_last_miss_us, eden_heap_steal_last_miss_bytes,
+    eden_heap_steal_busy_us;
+static atomic_uint eden_heap_steal_cursor;
+/* Scratch, used under the creation lock only: the 2 MiB slots of the arenas threads are on and of
+ * every record's first arena, the arenas threads are on whose mspace is not in their own slot, and
+ * per space the arenas in it and the empty ones no thread is on. */
+#define EDEN_HEAP_STEAL_WORDS ((EDEN_HEAP_SLOTS + 63u) / 64u)
+static unsigned long long eden_heap_steal_named[EDEN_HEAP_STEAL_WORDS], eden_heap_steal_first[EDEN_HEAP_STEAL_WORDS];
+static void *eden_heap_steal_odd[EDEN_HEAP_THREADS];
+static unsigned short eden_heap_steal_arenas_in[EDEN_HEAP_PIECES], eden_heap_steal_idle_in[EDEN_HEAP_PIECES];
+
+void eden_heap_set_steal(int mode) {
+  atomic_store_explicit(&eden_heap_steal_mode, mode, memory_order_relaxed);
+}
+
+int eden_heap_steal_mode_now(void) {
+  return atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed);
+}
+
+/* The counters, in the order of the enum above (EDEN_STEAL_TEST_REFUSED: EDEN_TEST_HEAP_NO_GROW). */
+unsigned eden_heap_steal_stats(unsigned long long *values, unsigned count) {
+  for (unsigned i = 0; i < count && i < EDEN_STEAL_STATS; ++i)
+    values[i] = i == EDEN_STEAL_TEST_REFUSED ? atomic_load_explicit(&eden_heap_no_grow_refused, memory_order_relaxed)
+                                             : atomic_load_explicit(&eden_heap_steal_stat[i], memory_order_relaxed);
+  return EDEN_STEAL_STATS;
+}
+
+static void eden_heap_steal_bump(unsigned which, unsigned long long by) {
+  atomic_fetch_add_explicit(&eden_heap_steal_stat[which], by, memory_order_relaxed);
+}
+
+/* The creation lock, or 0. `budget_us` 0: one try, no spin, no sleep. Else 64 spins (as
+ * eden_heap_create_acquire), then sleeps of about 50 us while less than `budget_us` of process time
+ * has passed since the first miss: the wait is bounded by time, plus at most one sleep. Released
+ * with eden_heap_create_release. */
+static int eden_heap_create_try(unsigned long long budget_us) {
+  if (atomic_flag_test_and_set_explicit(&eden_heap_arena_create_lock, memory_order_acquire)) {
+    if (budget_us == 0)
+      return 0;
+    const unsigned long long from = (unsigned long long)sceKernelGetProcessTime();
+    atomic_fetch_add_explicit(&eden_heap_create_waiters, 1, memory_order_relaxed);
+    for (unsigned spins = 0; atomic_flag_test_and_set_explicit(&eden_heap_arena_create_lock, memory_order_acquire);
+         ++spins) {
+      if (spins < 64) {
+        __builtin_ia32_pause();
+      } else if ((unsigned long long)sceKernelGetProcessTime() - from < budget_us) {
+        sceKernelUsleep(50);
+      } else {
+        atomic_fetch_sub_explicit(&eden_heap_create_waiters, 1, memory_order_relaxed);
+        return 0;
+      }
+    }
+    atomic_fetch_sub_explicit(&eden_heap_create_waiters, 1, memory_order_relaxed);
+  }
+  atomic_store_explicit(&eden_heap_create_holder, (unsigned long)pthread_self(), memory_order_relaxed);
+  return 1;
+}
+
+/* Within `window_us` of `stamp` (0: never). A stamp later than `now` (another thread wrote it after
+ * this one read the clock) counts as within. */
+static int eden_heap_steal_within(unsigned long long stamp, unsigned long long now, unsigned long long window_us) {
+  return stamp != 0 && (stamp > now || now - stamp < window_us);
+}
+
+/* Modes 2 and 3: a search for at least `bytes` found nothing less than EDEN_HEAP_STEAL_MISS_US ago,
+ * so a search for `bytes` would find nothing either. Keyed on size: a smaller request may still fit.
+ * The size is stored before the time (release) and read after it (acquire); two misses at once can
+ * still pair one's time with the other's size, which only skips or allows one search too many. */
+static int eden_heap_steal_cached(unsigned long long now, size_t bytes) {
+  const unsigned long long missed = atomic_load_explicit(&eden_heap_steal_last_miss_us, memory_order_acquire);
+  if (!eden_heap_steal_within(missed, now, EDEN_HEAP_STEAL_MISS_US))
+    return 0;
+  return (unsigned long long)bytes >= atomic_load_explicit(&eden_heap_steal_last_miss_bytes, memory_order_relaxed);
+}
+
+/* Whether a record names `arena` as the one its thread is on now (an ended thread's record too: the
+ * next thread on it starts there). Under the creation lock: 512 relaxed loads. */
+static int eden_heap_steal_named_now(const void *arena) {
+  for (unsigned r = 0; r < EDEN_HEAP_THREADS; ++r)
+    if (__atomic_load_n(&eden_heap_threads[r].arena, __ATOMIC_RELAXED) == arena)
+      return 1;
+  return 0;
+}
+
+/* Marks the slot of `arena` (an arena's mspace) in `bits`; 0 when its mspace does not lie in the slot
+ * of its own block (then it is looked up by pointer). Under the creation lock. */
+static int eden_heap_steal_mark(unsigned long long *bits, void *arena) {
+  const uintptr_t slot = eden_heap_slot(arena);
+  if (slot >= EDEN_HEAP_SLOTS || atomic_load_explicit(&eden_heap_slots[slot], memory_order_relaxed) != arena)
+    return 0;
+  bits[slot >> 6] |= 1ull << (slot & 63u);
+  return 1;
+}
+
+static int eden_heap_steal_marked(const unsigned long long *bits, uintptr_t slot) {
+  return slot < EDEN_HEAP_SLOTS && (bits[slot >> 6] >> (slot & 63u)) & 1u;
+}
+
+/* Takes `arena` off the spares, if it is one (under the creation lock), counted as a spare taken
+ * again, as eden_heap_create_arena_locked counts one. 1: it was. The caller puts it in a record. */
+static int eden_heap_steal_unspare(void *arena) {
+  const unsigned spares = atomic_load_explicit(&eden_heap_spare_count, memory_order_relaxed);
+  for (unsigned i = 0; i < spares; ++i)
+    if (eden_heap_spare[i] == arena) {
+      eden_heap_spare[i] = eden_heap_spare[spares - 1];
+      atomic_store_explicit(&eden_heap_spare_count, spares - 1, memory_order_relaxed);
+      atomic_fetch_add_explicit(&eden_heap_arenas_taken_again, 1, memory_order_relaxed);
+      eden_heap_steal_bump(EDEN_STEAL_FROM_SPARES, 1);
+      return 1;
+    }
+  return 0;
+}
+
+/* Mode 3: the empty arena that just served `self` becomes one of its own and the one it uses. It
+ * leaves the record that had it (never as that record's first arena: the next thread on a record
+ * starts there), as eden_heap_return_record takes one off; a spare leaves the spares. No thread is on
+ * it (the caller checked), and every reader of a record's own arenas reads them under the creation
+ * lock, held here. `index`: its entry in eden_heap_arena_list. */
+static void eden_heap_steal_rehome(struct eden_heap_thread *self, void *arena, unsigned index) {
+  (void)eden_heap_steal_unspare(arena);
+  int mine = 0;
+  for (unsigned r = 0; r < EDEN_HEAP_THREADS; ++r) {
+    struct eden_heap_thread *record = &eden_heap_threads[r];
+    unsigned owned = __atomic_load_n(&record->owned, __ATOMIC_ACQUIRE);
+    unsigned k = 0;
+    while (k < owned && __atomic_load_n(&record->own[k], __ATOMIC_RELAXED) != arena)
+      ++k;
+    if (k == owned)
+      continue;
+    if (record == self) {
+      mine = 1;
+      break;
+    }
+    if (k == 0) {
+      eden_heap_steal_bump(EDEN_STEAL_KEPT_FIRST, 1);
+      self->steal = index + 1u;
+      return;
+    }
+    for (; k + 1 < owned; ++k)
+      __atomic_store_n(&record->own[k], __atomic_load_n(&record->own[k + 1], __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+    __atomic_store_n(&record->owned, owned - 1, __ATOMIC_RELEASE);
+    break;
+  }
+  if (!mine)
+    eden_heap_keep_arena(self, arena);
+  eden_heap_use_arena(self, arena);
+  self->retry = 0;
+  self->steal = 0;
+  eden_heap_steal_bump(EDEN_STEAL_REHOMED, 1);
+}
+
+/* The time a try took, into the totals and the longest (the lock wait included). */
+static void eden_heap_steal_timed(unsigned long long start, unsigned long long end) {
+  const unsigned long long took = end > start ? end - start : 0;
+  eden_heap_steal_bump(EDEN_STEAL_TIME_US, took);
+  unsigned long long longest = atomic_load_explicit(&eden_heap_steal_stat[EDEN_STEAL_LONGEST_US], memory_order_relaxed);
+  while (took > longest &&
+         !atomic_compare_exchange_weak_explicit(&eden_heap_steal_stat[EDEN_STEAL_LONGEST_US], &longest, took,
+                                                memory_order_relaxed, memory_order_relaxed)) {
+  }
+}
+
+static void *eden_heap_steal(int kind, size_t a, size_t b, size_t bytes, int before_grow) {
+  const int mode = atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed);
+  if (mode == 0 || bytes == 0)
+    return NULL;
+  /* An arena's own block: asked by eden_heap_create_arena_locked under the creation lock. */
+  if (kind == EDEN_HEAP_ALIGNED && a == EDEN_HEAP_ARENA_SIZE && b == EDEN_HEAP_ARENA_PAYLOAD)
+    return NULL;
+  /* eden_heap_main's `bytes` of an aligned request is alignment + size: room for either. */
+  const size_t alignment = kind == EDEN_HEAP_ALIGNED ? a : 0;
+  const size_t size = kind == EDEN_HEAP_ALIGNED ? b : bytes;
+  if (alignment > ((size_t)64 << 10) || bytes > EDEN_HEAP_STEAL_MAX) {
+    eden_heap_steal_bump(EDEN_STEAL_TOO_BIG, 1);
+    return NULL;
+  }
+  /* Triggers: requests this could serve (too big ones are counted apart, above). */
+  eden_heap_steal_bump(before_grow ? EDEN_STEAL_TRIGGER_BEFORE_GROW : EDEN_STEAL_TRIGGER_REFUSAL, 1);
+  /* The lock is not recursive (a report that prints while it walks the arenas, an arena's block). */
+  if (atomic_load_explicit(&eden_heap_create_holder, memory_order_relaxed) == (unsigned long)pthread_self()) {
+    eden_heap_steal_bump(EDEN_STEAL_LOCK_HELD, 1);
+    return NULL;
+  }
+  const unsigned long long start = (unsigned long long)sceKernelGetProcessTime();
+  /* The record before the lock: claiming one (a thread's first request) may call pthread_setspecific. */
+  struct eden_heap_thread *self = mode >= 2 ? eden_heap_self() : NULL;
+  if (mode == 1) {
+    const unsigned long long last = atomic_load_explicit(&eden_heap_steal_last_scan_us, memory_order_relaxed);
+    if (eden_heap_steal_within(last, start, EDEN_HEAP_STEAL_COUNT_US)) {
+      eden_heap_steal_bump(EDEN_STEAL_RATE, 1);
+      return NULL;
+    }
+  } else if ((self == NULL || self->steal == 0) && eden_heap_steal_cached(start, bytes)) {
+    /* No sticky arena to ask, and a search for this much or less just found nothing: no lock. */
+    eden_heap_steal_bump(EDEN_STEAL_CACHED, 1);
+    return NULL;
+  }
+  /* Count mode never waits for the lock (the off arm does not); the others wait their budget, or
+   * try once within EDEN_HEAP_STEAL_BUSY_US of a give-up. */
+  unsigned long long budget = before_grow ? EDEN_HEAP_STEAL_WAIT_BEFORE_GROW_US : EDEN_HEAP_STEAL_WAIT_REFUSAL_US;
+  if (mode == 1 ||
+      eden_heap_steal_within(atomic_load_explicit(&eden_heap_steal_busy_us, memory_order_relaxed), start,
+                             EDEN_HEAP_STEAL_BUSY_US))
+    budget = 0;
+  if (!eden_heap_create_try(budget)) {
+    const unsigned long long end = (unsigned long long)sceKernelGetProcessTime();
+    if (budget != 0) {
+      atomic_store_explicit(&eden_heap_steal_busy_us, end | 1u, memory_order_relaxed);
+      eden_heap_steal_bump(EDEN_STEAL_LOCK_BUSY, 1);
+    } else {
+      eden_heap_steal_bump(EDEN_STEAL_BUSY_NO_WAIT, 1);
+    }
+    eden_heap_steal_timed(start, end);
+    return NULL;
+  }
+  void *address = NULL, *from = NULL;
+  unsigned from_index = 0;
+  int from_empty = 0, scanned = 0;
+  /* The arena this thread was served from last: a stream of 256 KiB+ requests (they never use an
+   * arena of the thread's own) takes a scan only when it is full. Asked before the 5 ms cache: the
+   * cache says the scan found nothing, not that this arena is full. Dropped when it is a spare (whole,
+   * for the next thread) or when any record names it now: it became a thread's arena since (its
+   * owner went back to it, an adopt, or a spare handed out as a new thread's first). */
+  if (self != NULL && self->steal != 0) {
+    const unsigned index = self->steal - 1u;
+    void *last = index < atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire)
+                     ? eden_heap_arena_list[index]
+                     : NULL;
+    self->steal = 0;
+    if (last != NULL && (eden_heap_is_spare(last) || eden_heap_steal_named_now(last))) {
+      eden_heap_steal_bump(EDEN_STEAL_STICKY_DROPPED, 1);
+    } else if (last != NULL) {
+      address = eden_heap_space_try(last, kind, a, b);
+      if (address != NULL) {
+        eden_heap_arena_took(address);
+        eden_heap_steal_bump(EDEN_STEAL_SERVED_STICKY, 1);
+        self->steal = index + 1u;
+      }
+    }
+  }
+  /* Mode 2/3, nothing from the sticky arena: the cache again, now under the lock (a thread that
+   * missed while this one waited counts). */
+  if (address == NULL && mode >= 2 && eden_heap_steal_cached(start, bytes)) {
+    eden_heap_steal_bump(EDEN_STEAL_CACHED, 1);
+  } else if (address == NULL) {
+    scanned = 1;
+    eden_heap_steal_bump(EDEN_STEAL_SCANS, 1);
+    /* Which arenas threads are on (by the slot of their mspace) and which are a record's first. */
+    memset(eden_heap_steal_named, 0, sizeof(eden_heap_steal_named));
+    memset(eden_heap_steal_first, 0, sizeof(eden_heap_steal_first));
+    memset(eden_heap_steal_arenas_in, 0, sizeof(eden_heap_steal_arenas_in));
+    memset(eden_heap_steal_idle_in, 0, sizeof(eden_heap_steal_idle_in));
+    unsigned odd = 0;
+    for (unsigned r = 0; r < EDEN_HEAP_THREADS; ++r) {
+      void *on = __atomic_load_n(&eden_heap_threads[r].arena, __ATOMIC_RELAXED);
+      if (on != NULL && !eden_heap_steal_mark(eden_heap_steal_named, on))
+        eden_heap_steal_odd[odd++] = on;
+      if (__atomic_load_n(&eden_heap_threads[r].owned, __ATOMIC_ACQUIRE) != 0) {
+        void *first = __atomic_load_n(&eden_heap_threads[r].own[0], __ATOMIC_RELAXED);
+        if (first != NULL)
+          (void)eden_heap_steal_mark(eden_heap_steal_first, first);
+      }
+    }
+    const uintptr_t base = (uintptr_t)ps5_heap_base;
+    const unsigned arenas = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
+    const unsigned at = arenas != 0 ? atomic_fetch_add_explicit(&eden_heap_steal_cursor, 1, memory_order_relaxed) % arenas : 0;
+    unsigned empty = 0, partly = 0, empty_tries = 0;
+    for (unsigned i = 0; i < arenas; ++i) {
+      const unsigned index = (at + i) % arenas;
+      void *arena = eden_heap_arena_list[index];
+      const uintptr_t block = (uintptr_t)atomic_load_explicit(&eden_heap_arena_blocks_probe[index], memory_order_relaxed);
+      if (arena == NULL || block == 0)
+        continue;
+      const uintptr_t slot = eden_heap_slot((const void *)block);
+      const unsigned space = atomic_load_explicit(&eden_heap_piece_slot[(block - base) >> EDEN_HEAP_PIECE_SHIFT],
+                                                  memory_order_relaxed);
+      if (space < EDEN_HEAP_PIECES)
+        eden_heap_steal_arenas_in[space]++;
+      int named = eden_heap_steal_marked(eden_heap_steal_named, slot);
+      for (unsigned k = 0; !named && k < odd; ++k)
+        named = eden_heap_steal_odd[k] == arena;
+      if (named)
+        continue;
+      /* Read under the creation lock: every allocation into an arena no thread is on is made
+       * under it, and a free lowers the count after the block is back, so 0 here is exact. */
+      if (atomic_load_explicit(&eden_heap_arena_live[slot].blocks, memory_order_relaxed) != 0) {
+        ++partly;
+        continue;
+      }
+      const int idle = space < EDEN_HEAP_PIECES && !eden_heap_steal_marked(eden_heap_steal_first, slot);
+      if (mode >= 2 && address == NULL && empty_tries < EDEN_HEAP_STEAL_EMPTY_TRIES) {
+        ++empty_tries;
+        address = eden_heap_space_try(arena, kind, a, b);
+        if (address != NULL) {
+          eden_heap_arena_took(address);
+          from = arena;
+          from_index = index;
+          from_empty = 1;
+          eden_heap_steal_bump(EDEN_STEAL_SERVED_EMPTY, 1);
+          ++partly; /* not empty any more, and its space not idle */
+          continue;
+        }
+      }
+      ++empty;
+      if (idle)
+        eden_heap_steal_idle_in[space]++;
+    }
+    /* Spaces that hold nothing but empty arenas no thread is on, none a record's first: what a
+     * step that retires such arenas and gives their spaces back could return. */
+    unsigned spaces_idle = 0;
+    unsigned long long spaces_idle_mib = 0;
+    const unsigned spaces = atomic_load_explicit(&eden_heap_space_count, memory_order_acquire);
+    for (unsigned slot = 1; slot < spaces && slot < EDEN_HEAP_PIECES; ++slot) {
+      const unsigned in = eden_heap_steal_arenas_in[slot];
+      if (in == 0 || eden_heap_space_span[slot] == 0 || eden_heap_steal_idle_in[slot] != in ||
+          atomic_load_explicit(&eden_heap_space_blocks[slot], memory_order_relaxed) != (long)in)
+        continue;
+      ++spaces_idle;
+      spaces_idle_mib += (unsigned long long)eden_heap_space_span[slot] << (EDEN_HEAP_PIECE_SHIFT - 20);
+    }
+    /* Then partly used ones, a bounded number of calls (another thread may be freeing into them:
+     * their mspace's lock orders that). */
+    for (unsigned i = 0, tries = 0; mode >= 2 && address == NULL && i < arenas && tries < EDEN_HEAP_STEAL_PARTLY; ++i) {
+      const unsigned index = (at + i) % arenas;
+      void *arena = eden_heap_arena_list[index];
+      const uintptr_t block = (uintptr_t)atomic_load_explicit(&eden_heap_arena_blocks_probe[index], memory_order_relaxed);
+      if (arena == NULL || block == 0)
+        continue;
+      const uintptr_t slot = eden_heap_slot((const void *)block);
+      int named = eden_heap_steal_marked(eden_heap_steal_named, slot);
+      for (unsigned k = 0; !named && k < odd; ++k)
+        named = eden_heap_steal_odd[k] == arena;
+      if (named || atomic_load_explicit(&eden_heap_arena_live[slot].blocks, memory_order_relaxed) == 0)
+        continue;
+      ++tries;
+      address = eden_heap_space_try(arena, kind, a, b);
+      if (address != NULL) {
+        eden_heap_arena_took(address);
+        from = arena;
+        from_index = index;
+        eden_heap_steal_bump(EDEN_STEAL_SERVED_PARTLY, 1);
+      }
+    }
+    atomic_store_explicit(&eden_heap_steal_stat[EDEN_STEAL_LAST_ODD], odd, memory_order_relaxed);
+    atomic_store_explicit(&eden_heap_steal_stat[EDEN_STEAL_LAST_EMPTY], empty, memory_order_relaxed);
+    atomic_store_explicit(&eden_heap_steal_stat[EDEN_STEAL_LAST_PARTLY], partly, memory_order_relaxed);
+    atomic_store_explicit(&eden_heap_steal_stat[EDEN_STEAL_LAST_SPACES], spaces_idle, memory_order_relaxed);
+    atomic_store_explicit(&eden_heap_steal_stat[EDEN_STEAL_LAST_SPACE_MIB], spaces_idle_mib, memory_order_relaxed);
+    const unsigned long long low = atomic_load_explicit(&eden_heap_steal_stat[EDEN_STEAL_MIN_EMPTY_PLUS1], memory_order_relaxed);
+    if (low == 0 || (unsigned long long)empty + 1u < low)
+      atomic_store_explicit(&eden_heap_steal_stat[EDEN_STEAL_MIN_EMPTY_PLUS1], (unsigned long long)empty + 1u,
+                            memory_order_relaxed);
+    if (mode == 1 && empty != 0)
+      eden_heap_steal_bump(EDEN_STEAL_WOULD, 1);
+  }
+  if (from != NULL && self != NULL) {
+    if (mode >= 3 && from_empty && size < EDEN_HEAP_SMALL_REQUEST && alignment <= 4096 &&
+        self->owned < EDEN_HEAP_THREAD_ARENAS) {
+      eden_heap_steal_rehome(self, from, from_index);
+    } else {
+      /* A spare that served leaves the spares only into this thread's record, kept but not used
+       * (never as its first: the next thread on the record starts there), so it is not lost to
+       * them: return_record gives it back to the spares once empty, and the arena table counts it.
+       * When the record has no first arena yet or is full, it stays a spare that holds a block: a
+       * new thread that takes it shares it, as after an adopt. */
+      if (self->owned != 0 && self->owned < EDEN_HEAP_THREAD_ARENAS && eden_heap_steal_unspare(from)) {
+        eden_heap_keep_arena(self, from);
+        eden_heap_steal_bump(EDEN_STEAL_SPARE_KEPT, 1);
+      }
+      self->steal = from_index + 1u;
+    }
+  }
+  eden_heap_create_release();
+  const unsigned long long end = (unsigned long long)sceKernelGetProcessTime();
+  eden_heap_steal_timed(start, end);
+  if (mode == 1) {
+    atomic_store_explicit(&eden_heap_steal_last_scan_us, start | 1u, memory_order_relaxed);
+  } else if (address != NULL) {
+    eden_heap_steal_bump(EDEN_STEAL_SERVED_BYTES, size);
+  } else if (scanned) {
+    /* Size first, then time: a reader that sees the new time sees this size or a later one. */
+    atomic_store_explicit(&eden_heap_steal_last_miss_bytes, (unsigned long long)bytes, memory_order_relaxed);
+    atomic_store_explicit(&eden_heap_steal_last_miss_us, end | 1u, memory_order_release);
+    eden_heap_steal_bump(EDEN_STEAL_NONE, 1);
+  }
   return address;
 }
 
@@ -1940,10 +2466,52 @@ static int eden_heap_starve(size_t bytes) {
   return 1;
 }
 
+/* T130: a test refusal while EDEN_UP_HEAP_STEAL is on goes where a real refusal goes when the heap
+ * could not grow (eden_heap_main): to eden_heap_steal, with the same arguments; mode 3 also stamps
+ * "the pool said no" as eden_heap_grow does, so the next second asks the idle arenas first. Mode 0
+ * (unset): NULL at once, as before. Counted for the 20 s heap summary (eden_heap_test_aid_stats). */
+static atomic_ullong eden_heap_starve_to_steal, eden_heap_starve_stolen;
+
+static void *eden_heap_starve_refuse(size_t count, size_t size, int zero, size_t bytes) {
+  const int mode = atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed);
+  if (mode == 0)
+    return NULL;
+  if (mode >= 3)
+    atomic_store_explicit(&eden_heap_steal_pool_no_us, (unsigned long long)sceKernelGetProcessTime() | 1u,
+                          memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_starve_to_steal, 1, memory_order_relaxed);
+  void *address = eden_heap_steal(zero ? EDEN_HEAP_CALLOC : EDEN_HEAP_MALLOC, zero ? count : bytes, zero ? size : 0,
+                                  bytes, 0);
+  if (address != NULL)
+    atomic_fetch_add_explicit(&eden_heap_starve_stolen, 1, memory_order_relaxed);
+  return address;
+}
+
+/* The two test aids' own counts, whatever the steal mode (the 20 s heap summary,
+ * headless/performance.cpp): EDEN_TEST_HEAP_STARVE every, requests seen, shortages begun, requests
+ * refused, refusals sent to the steal, served by it; EDEN_TEST_HEAP_NO_GROW every, growths seen,
+ * refused. Returns how many values it knows (9). */
+unsigned eden_heap_test_aid_stats(unsigned long long *values, unsigned count) {
+  const unsigned long long all[9] = {
+      atomic_load_explicit(&eden_heap_starve_every, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_starve_seen, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_starve_begun, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_starve_refused, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_starve_to_steal, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_starve_stolen, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_no_grow_every, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_no_grow_seen, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_no_grow_refused, memory_order_relaxed),
+  };
+  for (unsigned i = 0; i < count && i < 9u; ++i)
+    values[i] = all[i];
+  return 9u;
+}
+
 static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   const size_t bytes = count * size;
   if (eden_heap_starve(bytes))
-    return NULL;
+    return eden_heap_starve_refuse(count, size, zero, bytes);
   if (bytes >= EDEN_HEAP_SMALL_REQUEST && bytes < EDEN_HEAP_LARGE_REQUEST)
     eden_heap_class_note(bytes);
   if (bytes >= atomic_load_explicit(&eden_heap_large_from, memory_order_relaxed) && eden_heap_grows) {
@@ -2026,6 +2594,18 @@ void eden_heap_wait_gpu_stats(unsigned long long *count, unsigned long long *tot
 
 unsigned eden_heap_wanted(void) {
   return atomic_load_explicit(&eden_heap_waiting, memory_order_relaxed);
+}
+
+/* EDEN_UP_HLE_OOM_RETRY (core/hle/service/hle_reply_buffers.h): a service thread whose request
+ * was refused memory before its service code ran sleeps a moment and tries once more; meanwhile it
+ * counts as a waiting request here (1: in, 0: out), so the caches see memory short with none free
+ * and the texture collector evicts at its hardest, as for a pipeline builder's wait above. Called
+ * only by that switch: unset, eden_heap_waiting moves as before. */
+void eden_heap_want(int enter) {
+  if (enter)
+    atomic_fetch_add_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
+  else
+    atomic_fetch_sub_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
 }
 
 void eden_heap_wait_stats(unsigned long long *count, unsigned long long *total_ms, unsigned *longest_ms,

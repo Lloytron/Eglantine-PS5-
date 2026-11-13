@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "fastmem.h"
+#include "../headless/memory_wait.h" // WaitForBlock's limit (EDEN_GUEST_WRITE_WAIT_MS)
 
 // EDEN_UP_* switches (guest_memory_service.inc). The host checks compile this file without the
 // core's include path (tools/check-jit-allocator.py): there, the same rule written out.
@@ -73,6 +74,8 @@ std::int32_t sceKernelReleaseDirectMemory(std::int64_t, std::size_t);
 std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*, std::size_t*);
 std::int32_t sceKernelReserveVirtualRange(void**, std::size_t, int, std::size_t);
 std::int32_t sceKernelEnableDmemAliasing();
+// kern.sdk_version, the firmware (EDEN_GUEST_SWAP_AHEAD_MIB=auto); declared as headless/boot_trace.h does.
+int sysctlbyname(const char*, void*, std::size_t*, const void*, std::size_t);
 int sceKernelDebugOutText(int, const char*);
 }
 #endif
@@ -1110,6 +1113,12 @@ std::size_t CommittedSplit() noexcept {
 // So a cache is address space only, in two ranges (the one the JIT writes through and the one
 // the code runs from), and memory is put behind both a step at a time as the JIT reaches it:
 // CommitCodeRange is asked before every block. Memory is not taken back while the cache lives.
+#ifdef PS5_NATIVE
+// EDEN_UP_JIT_COMMIT_AHEAD's room (headless/performance.cpp, headless/heap_arenas.inc). Weak: a check
+// built without the frontend links, and finds no room it can measure.
+extern "C" unsigned long long eden_pool_largest_free(void) __attribute__((weak));
+extern "C" unsigned eden_heap_wanted(void) __attribute__((weak));
+#endif
 namespace {
 constexpr std::size_t CodeStep = std::size_t{16} << 20;
 constexpr std::size_t CodeSteps = 64; // the largest cache: 1 GiB
@@ -1121,10 +1130,184 @@ struct CodeRange {
     std::atomic<std::size_t> committed{0};
     std::size_t pieces = 0; // 2 MiB blocks mapped (a step stopped half way keeps those it has)
     std::int64_t physical[CodeSteps * CodePieces] = {}; // per 2 MiB block
+    // EDEN_UP_JIT_COMMIT_AHEAD only (untouched while it is off). Written by the threads that compile
+    // into this cache (its guest core, and the precompile thread at boot), read by the 10 s line.
+    std::atomic<std::size_t> written{0};        // how far the JIT last said it is about to write
+    std::atomic<std::size_t> ahead_for{0};      // `committed` when this step's mark was passed (0: not yet)
+    std::atomic<std::uint32_t> ahead_skip{0};   // blocks before the room is looked at again
+    std::atomic<std::uint32_t> ahead_checks{0}; // times the room was looked at since the mark
+    std::atomic<bool> ahead_room{false};        // room was there at least once since the mark
+    std::size_t need_for = 0;                   // `committed` of the last step counted at the need (code_mutex)
+    std::atomic<bool> need_waiting{false};      // its need was refused and not served yet (counted below)
 };
 std::array<CodeRange, 16> code_ranges;
 std::mutex code_mutex;
 std::atomic<std::size_t> code_reserved{0}, code_committed{0};
+// EDEN_UP_JIT_COMMIT_AHEAD only: caches whose need was refused and not yet served (their JIT waits in
+// commit(), jit-allocator.h). While one does, no other cache maps ahead: the waiting need comes first.
+// Set under code_mutex where the need is refused; cleared where it is served (under code_mutex), on
+// the cache's next compiled block (CommitAhead), or when the cache is freed.
+std::atomic<unsigned> code_needs_waiting{0};
+// Blocks mapped ahead lately, all caches (code_mutex): the pool's largest free piece is a reading up to
+// 20 ms old, so what ahead took since then is taken off it again. Kept while blocks follow each other
+// within 20 ms, 0 after a gap (it may then count a block twice: never too little).
+std::uint64_t ahead_recent_ns = 0;
+std::size_t ahead_recent_bytes = 0;
+
+// EDEN_UP_JIT_COMMIT_AHEAD=<mode>[,<mark>[,<room MiB>]] (off unless set; headless/heap_pages.cpp reads
+// it from main, before the first cache, so env.txt only: env-<title id>.txt comes later). The owner's
+// 11 Nov session ended when a cache needed its next 16 MiB step in the fight with the pool's largest
+// free piece at 1 MiB and the guest's reserve under its floor; the same cache had held 64 MiB for 400 s
+// (held, not written: when it reached 60 MiB written is not logged), through stretches with 40 to 800 MiB
+// free. So: once the JIT has written <mark> % of a cache's newest step (default 75: 4 MiB left), the next
+// step is mapped one 2 MiB block per compiled block, from the pool only, and only while there is room:
+// the pool's largest free piece, less what ahead took since that reading, at least <room> MiB (default
+// 32) plus what this step still has to map (so <room> is what stays free once the step is whole), the
+// guest's reserve at what its keeper fills it to, and no game write, pipeline builder or other cache's
+// need waiting for memory. Never the reserve itself (no
+// transfer, no lend): what the game's writes live on stays theirs. 1: count only (what it would do, and
+// whether there was room before the need); 2: map. A refused or skipped block changes nothing: at the
+// need the old path (pool, transfer, lend, wait, abort) runs as before, from the blocks it has.
+std::atomic<int> ahead_mode{0};
+std::atomic<unsigned> ahead_mark_pct{75};
+std::atomic<std::size_t> ahead_room_bytes{std::size_t{32} << 20};
+constexpr std::uint32_t AheadRecheckBlocks = 64; // no room: blocks before the next look
+constexpr std::uint32_t AheadBusyBlocks = 8;     // another cache is mapping: blocks before trying again
+enum AheadCount : unsigned {
+    kAheadCrossed,       // marks passed (one per step of a cache)
+    kAheadWould,         // mode 1: steps that found room before the need
+    kAheadPieces,        // mode 2: 2 MiB blocks mapped ahead
+    kAheadSteps,         // mode 2: steps made whole ahead
+    kAheadNoLargest,     // looks with the pool's largest free piece under the room (+ the step's rest)
+    kAheadNoReserve,     // looks with the guest's reserve under what its keeper fills it to
+    kAheadNoWaiting,     // looks while a game write, a pipeline builder or a cache's need waited
+    kAheadNoUnknown,     // looks with the pool's size not known
+    kAheadRefused,       // blocks the pool refused ahead
+    kAheadBusy,          // the lock was held by another cache's step
+    kAheadNeedSteps,     // steps taken at the need (not counting a cache's first)
+    kAheadNeedMissed,    // of those: no room since the mark, or the mark not seen
+    kAheadNeedPartial,   // of those: finished from blocks mapped ahead
+    kAheadTestRefused,   // EDEN_TEST_JIT_COMMIT_REFUSE refusals so far
+    kAheadCounts
+};
+std::array<std::atomic<std::uint64_t>, kAheadCounts> ahead_counts{};
+std::atomic<std::size_t> ahead_held_most{0}; // the most mapped ahead and not yet written, all caches
+void AheadAdd(AheadCount which) noexcept {
+    ahead_counts[which].fetch_add(1, std::memory_order_relaxed);
+}
+// A cache's need refused (code_mutex held) / served or gone: code_needs_waiting counts each cache once.
+void NeedRefused(CodeRange& range) noexcept {
+    if (!range.need_waiting.exchange(true, std::memory_order_acq_rel))
+        code_needs_waiting.fetch_add(1, std::memory_order_acq_rel);
+}
+void NeedServed(CodeRange& range) noexcept {
+    if (range.need_waiting.load(std::memory_order_relaxed) && range.need_waiting.exchange(false, std::memory_order_acq_rel))
+        code_needs_waiting.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+#ifdef PS5_NATIVE
+// EDEN_UP_JIT_LEND_UNDER_FLOOR: the reason of the last piece line (code_mutex); 0 again when a step is
+// whole, so a later episode prints its first line again.
+int code_lend_last_why = 0;
+#endif
+
+// EDEN_TEST_JIT_COMMIT_REFUSE=<n>[,<after s>[,<where>]] (a test, off unless set; headless/heap_pages.cpp
+// reads it from main, from env.txt only: env-<title id>.txt comes later). The one test hook of T132's
+// three code-store fixes (EDEN_UP_JIT_LEND_UNDER_FLOOR, EDEN_UP_JIT_COMMIT_AHEAD,
+// EDEN_UP_JIT_COMMIT_RECLAIM): from <after s> seconds after the read on, the next <n> 2 MiB blocks the
+// code caches ask for are refused as if the pool had none. No memory is taken away. A cache's first step
+// is never refused (it decides whether the cache grows at all). <where> is a sum (default 1):
+//   1  at the need: the pool, the reserve transfer and the lend above the floor all count as having said
+//      no, as at the owner's 11 Nov crash (28 blocks under a floor of 32, nothing lent). What comes after
+//      them runs as it would: the lend under the floor, the JIT's wait (each 20 ms retry asks again, so
+//      uses one refusal) and the reclaim. n=40 with nothing else on: one wait served after about 0.8 s;
+//      n=150: the owner's abort on demand.
+//   2  ahead: the early blocks of EDEN_UP_JIT_COMMIT_AHEAD.
+//   4  only inside a guest core's block compile (GetBlock), the one place EDEN_UP_JIT_COMMIT_RECLAIM=3
+//      can clear instead of ending the session; never the precompiler's or a batch's asks.
+//   8  only while the guest's reserve is at or under its floor, the state of the owner's crash (with the
+//      pool short the keeper fills it only to its floor: EDEN_TEST_POOL_HOG_MIB=896 makes that hold).
+//  16  <n> is milliseconds, not blocks: from the first refusal on, every ask that fits <where> is refused
+//      for <n> ms, then the hook is spent. This is the shape of the owner's crash (a pool with nothing
+//      for longer than the JIT's 2 s wait) whatever a fix does in between: 3000 ends a control run as he
+//      saw it, while a fix that serves the step some other way (the reserve, a clear) is not charged a
+//      refusal per block it saves. A count of blocks charges every 20 ms retry one.
+// Each refusal line gives the reserve, its floor and whether the pool is short, so a reader can see the
+// precondition held; with 8, an ask the reserve's level let through says so too.
+std::atomic<std::uint64_t> refuse_left{0};
+std::atomic<std::uint64_t> refuse_from_ns{0};
+std::atomic<unsigned> refuse_where{0};
+std::atomic<std::uint64_t> refuse_done{0}, refuse_let_through{0}; // written under code_mutex
+std::uint64_t refuse_until_ns = 0; // <where> 16: the window's end once it began (code_mutex)
+enum : unsigned { kRefuseNeed = 1, kRefuseAhead = 2, kRefuseInCompile = 4, kRefuseUnderFloor = 8, kRefuseWindow = 16 };
+std::uint64_t CodeNowNs() noexcept {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<std::uint64_t>(now.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(now.tv_nsec);
+}
+// code_mutex is held (every caller), so one thread at a time takes from the count. `step_at`: where
+// the step being asked for begins in the cache.
+bool TestRefusesPiece(bool ahead, const CodeRange& range, std::size_t step_at) noexcept {
+    const std::uint64_t left = refuse_left.load(std::memory_order_relaxed);
+    if (left == 0) return false; // off: this one load
+    const unsigned where = refuse_where.load(std::memory_order_relaxed);
+    const std::uint64_t now = CodeNowNs();
+    if ((where & (ahead ? kRefuseAhead : kRefuseNeed)) == 0 || now < refuse_from_ns.load(std::memory_order_relaxed))
+        return false;
+    // 16: a window of `left` ms from the first refusal; after it, the hook is spent (one line).
+    const bool window = (where & kRefuseWindow) != 0;
+    if (window && refuse_until_ns != 0 && now >= refuse_until_ns) {
+        refuse_left.store(0, std::memory_order_relaxed);
+        char over[192];
+        const int length = std::snprintf(over, sizeof(over),
+                                         "EDEN_TEST_JIT_COMMIT_REFUSE window of %llu ms over: %llu blocks refused in "
+                                         "it; asks are served as before from now on\n",
+                                         static_cast<unsigned long long>(left),
+                                         static_cast<unsigned long long>(refuse_done.load(std::memory_order_relaxed)));
+        if (length > 0) Report(over);
+        return false;
+    }
+    // 4: only inside a guest core's block compile, the scope GetBlock opens (headless/dynarmic/jit_impl.inc,
+    // headless/memory_wait.h: also opened for this hook alone, with EDEN_UP_JIT_COMMIT_RECLAIM unset).
+    if ((where & kRefuseInCompile) != 0 && ::Eden::MemoryWait::JitClearScope() == 0) return false;
+    const std::size_t count = reserve_count.load(std::memory_order_relaxed);
+    const std::size_t floor = reserve_floor.load(std::memory_order_relaxed);
+    const int pool_short = pool_is_short.load(std::memory_order_relaxed) ? 1 : 0;
+    const void* const code = reinterpret_cast<const void*>(range.executable.load(std::memory_order_relaxed));
+    char line[288];
+    if ((where & kRefuseUnderFloor) != 0 && count > floor) {
+        const std::uint64_t through = refuse_let_through.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (through == 1 || through % 100 == 0) {
+            const int length = std::snprintf(
+                line, sizeof(line),
+                "EDEN_TEST_JIT_COMMIT_REFUSE not refused, precondition not held: reserve %zu blocks, above its floor "
+                "%zu (pool short %d); code cache %p, step at %zu MiB (%llu such asks so far; hook still armed: %llu %s)\n",
+                count, floor, pool_short, code, step_at >> 20, static_cast<unsigned long long>(through),
+                static_cast<unsigned long long>(left), (where & kRefuseWindow) != 0 ? "ms window" : "refusals");
+            if (length > 0) Report(line);
+        }
+        return false;
+    }
+    if (window) {
+        if (refuse_until_ns == 0) refuse_until_ns = now + left * 1'000'000ull; // the window begins
+    } else {
+        refuse_left.store(left - 1, std::memory_order_relaxed);
+    }
+    const std::uint64_t done = refuse_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool last = !window && left == 1;
+    if (done <= 32 || done % 100 == 0 || last) {
+        const unsigned long long rest =
+            window ? (refuse_until_ns - now) / 1'000'000ull : static_cast<unsigned long long>(left - 1);
+        const int length = std::snprintf(
+            line, sizeof(line),
+            "EDEN_TEST_JIT_COMMIT_REFUSE refused a block asked %s: code cache %p, step at %zu MiB (%llu so far, %llu "
+            "%s left); reserve %zu blocks, floor %zu, pool short %d%s\n",
+            ahead ? "ahead" : "at the need", code, step_at >> 20, static_cast<unsigned long long>(done), rest,
+            window ? "ms" : "refusals", count, floor, pool_short, last ? "; that was the last" : "");
+        if (length > 0) Report(line);
+    }
+    return true;
+}
 // Lock-free: asked in a fault handler.
 bool InCodeCache(std::uintptr_t address) noexcept {
     for (const CodeRange& range : code_ranges) {
@@ -1139,14 +1322,39 @@ bool InCodeCache(std::uintptr_t address) noexcept {
 // guest's reserve holding 512 MiB, and Mario Kart World stopped there. A block the pool has none
 // for comes from that reserve, as a heap piece does (TakeHostReserveBlock leaves half of it for
 // the guest's writes and gives way to writes that wait). code_mutex is held.
+#ifdef PS5_NATIVE
+// One 2 MiB block of memory, `physical`, behind both ranges at block `index` of the cache, cleared.
+// code_mutex is held. (The need's own lines, moved here unchanged so the ahead path maps the same way.)
+bool MapCodePiece(CodeRange& range, std::size_t index, std::int64_t physical) {
+    void* const piece_writable = reinterpret_cast<void*>(range.writable + index * LargePage);
+    void* const piece_executable =
+        reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + index * LargePage);
+    void* at = piece_writable;
+    if (sceKernelMapDirectMemory(&at, LargePage, PROT_READ | PROT_WRITE, MAP_FIXED, physical, LargePage) != 0 ||
+        at != piece_writable)
+        return false;
+    std::memset(piece_writable, 0, LargePage);
+    at = piece_executable;
+    if (sceKernelMapDirectMemory(&at, LargePage, PROT_READ, MAP_FIXED, physical, LargePage) != 0 ||
+        at != piece_executable)
+        return false;
+    // As MapExecutableAlias: the mapping call refuses EXEC on some versions.
+    if (mprotect(piece_executable, LargePage, PROT_READ | PROT_EXEC) != 0) return false;
+    range.physical[index] = physical;
+    range.pieces = index + 1;
+    return true;
+}
+#endif
 bool CommitCodeStep(CodeRange& range, std::size_t offset) {
-    void* const writable = reinterpret_cast<void*>(range.writable + offset);
-    void* const executable = reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + offset);
 #ifdef PS5_NATIVE
     // A step that stopped half way goes on from the blocks it has (the JIT asks again).
     for (std::size_t piece = range.pieces - offset / LargePage; piece < CodePieces; ++piece) {
         std::int64_t physical = -1;
-        if (eden_direct_low(LargePage, LargePage, 12, &physical) != 0 && !TakeHostReserveBlock(&physical)) {
+        // EDEN_TEST_JIT_COMMIT_REFUSE (off: one load): the pool, the transfer and the lend above the floor
+        // all count as having said no. Never a cache's first step.
+        const bool refused_by_test = offset != 0 && TestRefusesPiece(false, range, offset);
+        if (refused_by_test ||
+            (eden_direct_low(LargePage, LargePage, 12, &physical) != 0 && !TakeHostReserveBlock(&physical))) {
             // EDEN_JIT_RESERVE_LEND=1 (off unless asked for): a piece the pool refuses ends the
             // session ("the console has no memory for its next part": run 161, 20 MiB left while
             // the guest's reserve held 256 MiB at its floor; TakeHostReserveBlock lends only above
@@ -1155,27 +1363,48 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
             // more: a piece is one 2 MiB block, so any lent block serves. EDEN_GUEST_RESERVE_FLOOR
             // sets what may go.
             static const bool lend = std::getenv("EDEN_JIT_RESERVE_LEND") != nullptr && std::getenv("EDEN_JIT_RESERVE_LEND")[0] == '1';
-            if (!lend || eden_guest_reserve_lend(LargePage) == 0 || eden_direct_low(LargePage, LargePage, 12, &physical) != 0)
-                return false;
-            std::fputs("EDEN_JIT_MEMORY a piece the pool refused came from the guest's reserve\n", stderr);
+            if (refused_by_test || !lend || eden_guest_reserve_lend(LargePage) == 0 ||
+                eden_direct_low(LargePage, LargePage, 12, &physical) != 0) {
+                // EDEN_UP_JIT_LEND_UNDER_FLOOR (guest_memory_service.inc, off unless set): the reserve's
+                // block itself, under its floor, down to JitLendKeep. Off: the refusal as before.
+                std::size_t left = 0;
+                int why = 0;
+                const int lent = JitLendUnderFloor(&physical, &left, &why);
+                // A line each time it lends; a refusal or a count-only "could have" when its reason
+                // changed (the JIT asks again every 20 ms while it waits; the 10 s line counts each).
+                if (why != 0 && (why != code_lend_last_why || lent)) {
+                    const void* const code_at =
+                        reinterpret_cast<const void*>(range.executable.load(std::memory_order_relaxed) + offset);
+                    char line[240];
+                    const int length = std::snprintf(
+                        line, sizeof(line),
+                        lent      ? "EDEN_UP_JIT_LEND_UNDER_FLOOR piece %zu of %zu of the code cache at %p (step at "
+                                    "%zu MiB) came from the guest's reserve: %zu blocks left (floor %zu, never under %zu)\n"
+                        : why == 1 ? "EDEN_UP_JIT_LEND_UNDER_FLOOR count only: piece %zu of %zu of the code cache at %p "
+                                     "(step at %zu MiB) could have come from the guest's reserve (%zu blocks, floor %zu, "
+                                     "never under %zu); refused as before\n"
+                        : why == 2 ? "EDEN_UP_JIT_LEND_UNDER_FLOOR piece %zu of %zu of the code cache at %p (step at "
+                                     "%zu MiB) refused: the guest's reserve is at its minimum (%zu blocks, floor %zu, "
+                                     "never under %zu)\n"
+                                   : "EDEN_UP_JIT_LEND_UNDER_FLOOR piece %zu of %zu of the code cache at %p (step at "
+                                     "%zu MiB) refused: a game write waits for a block (%zu blocks, floor %zu, never "
+                                     "under %zu)\n",
+                        piece + 1, CodePieces, code_at, offset >> 20, left,
+                        reserve_floor.load(std::memory_order_relaxed), JitLendKeep);
+                    if (length > 0) Report(line);
+                }
+                code_lend_last_why = lent ? 0 : why;
+                if (!lent) return false;
+            } else {
+                std::fputs("EDEN_JIT_MEMORY a piece the pool refused came from the guest's reserve\n", stderr);
+            }
         }
-        void* const piece_writable = static_cast<char*>(writable) + piece * LargePage;
-        void* const piece_executable = static_cast<char*>(executable) + piece * LargePage;
-        void* at = piece_writable;
-        if (sceKernelMapDirectMemory(&at, LargePage, PROT_READ | PROT_WRITE, MAP_FIXED, physical, LargePage) != 0 ||
-            at != piece_writable)
-            return false;
-        std::memset(piece_writable, 0, LargePage);
-        at = piece_executable;
-        if (sceKernelMapDirectMemory(&at, LargePage, PROT_READ, MAP_FIXED, physical, LargePage) != 0 ||
-            at != piece_executable)
-            return false;
-        // As MapExecutableAlias: the mapping call refuses EXEC on some versions.
-        if (mprotect(piece_executable, LargePage, PROT_READ | PROT_EXEC) != 0) return false;
-        range.physical[offset / LargePage + piece] = physical;
-        range.pieces = offset / LargePage + piece + 1;
+        if (!MapCodePiece(range, offset / LargePage + piece, physical)) return false;
     }
+    code_lend_last_why = 0; // EDEN_UP_JIT_LEND_UNDER_FLOOR: the step is whole (one store; off: stays 0)
 #else
+    void* const writable = reinterpret_cast<void*>(range.writable + offset);
+    void* const executable = reinterpret_cast<void*>(range.executable.load(std::memory_order_relaxed) + offset);
     if (mprotect(writable, CodeStep, PROT_READ | PROT_WRITE) != 0 ||
         mprotect(executable, CodeStep, PROT_READ | PROT_EXEC) != 0)
         return false;
@@ -1183,7 +1412,260 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
     code_committed.fetch_add(CodeStep, std::memory_order_relaxed);
     return true;
 }
+
+// ---- EDEN_UP_JIT_COMMIT_AHEAD ----
+
+enum class AheadRoom { yes, largest, reserve, waiting, unknown };
+// Room for one more 2 MiB block of code, from numbers read without a lock, a wait or the heap: the
+// pool's largest free piece (asked of the kernel at most every 20 ms in all, headless/performance.cpp),
+// the guest's reserve (two atomics) and the waiting writers (one atomic each). The game's memory comes
+// first: while its reserve is under what the keeper fills it to, or a write waits, the pool's room is
+// theirs. So is it while another cache's need waits (code_needs_waiting): that JIT retries every 20 ms
+// and must find what comes free before ahead does. The host (no pool to measure) always has room.
+// The largest-free test here is the cheap first look; the full rule (room + the step's rest, less what
+// ahead took since the reading) is CommitAhead's, under the lock.
+AheadRoom RoomForAhead(unsigned long long* largest, std::size_t* held, std::size_t* target) noexcept {
+    *largest = 0;
+    *held = 0;
+    *target = 0;
+    if (code_needs_waiting.load(std::memory_order_acquire) != 0) return AheadRoom::waiting;
+#ifdef PS5_NATIVE
+    if (eden_guest_memory_wanted() != 0 || (eden_heap_wanted && eden_heap_wanted() != 0)) return AheadRoom::waiting;
+    eden_guest_memory_reserve(held, target);
+    if (*held < *target) return AheadRoom::reserve;
+    *largest = eden_pool_largest_free ? eden_pool_largest_free() : 0;
+    if (*largest == 0) return AheadRoom::unknown;
+    if (*largest < ahead_room_bytes.load(std::memory_order_relaxed)) return AheadRoom::largest;
+#endif
+    return AheadRoom::yes;
+}
+
+// What is mapped ahead and not yet written, in all caches. code_mutex is held.
+std::size_t HeldAheadLocked() noexcept {
+    std::size_t held = 0;
+    for (const CodeRange& range : code_ranges) {
+        if (range.executable.load(std::memory_order_relaxed) == 0) continue;
+#ifdef PS5_NATIVE
+        const std::size_t mapped = range.pieces * LargePage;
+#else
+        const std::size_t mapped = range.committed.load(std::memory_order_relaxed);
+#endif
+        const std::size_t written = range.written.load(std::memory_order_relaxed);
+        const std::size_t needed = (written + CodeStep - 1) / CodeStep * CodeStep;
+        // More than a step past what is written: the cache was cleared and is written again from its
+        // start, in memory it already has. That is not memory taken early.
+        if (mapped > needed + CodeStep) continue;
+        if (mapped > needed) held += mapped - needed;
+    }
+    return held;
+}
+
+// One block (the host: the whole step) of the step after `committed`, from the pool only. True when
+// the step is whole now; *refused when the pool said no. code_mutex is held.
+bool MapAheadLocked(CodeRange& range, std::size_t committed, bool* refused) noexcept {
+    *refused = false;
+#ifdef PS5_NATIVE
+    const std::size_t index = range.pieces;
+    if (index < committed / LargePage || index >= (committed + CodeStep) / LargePage) return false; // not this step's
+    std::int64_t physical = -1;
+    if (TestRefusesPiece(true, range, committed) || eden_direct_low(LargePage, LargePage, 12, &physical) != 0) {
+        *refused = true;
+        return false;
+    }
+    if (!MapCodePiece(range, index, physical)) {
+        // As at the need: the block stays where it is; the step goes on from the blocks it has.
+        *refused = true;
+        return false;
+    }
+    AheadAdd(kAheadPieces);
+    // What ahead took since the pool's reading (RoomForAhead's rule in CommitAhead takes it off).
+    const std::uint64_t now = CodeNowNs();
+    if (now - ahead_recent_ns > 20'000'000ull) ahead_recent_bytes = 0;
+    ahead_recent_ns = now;
+    ahead_recent_bytes += LargePage;
+    if (range.pieces < (committed + CodeStep) / LargePage) return false;
+    code_committed.fetch_add(CodeStep, std::memory_order_relaxed);
+    return true;
+#else
+    if (!CommitCodeStep(range, committed)) {
+        *refused = true;
+        return false;
+    }
+    ahead_counts[kAheadPieces].fetch_add(CodePieces, std::memory_order_relaxed);
+    return true;
+#endif
+}
+
+// The fast path, with the switch on: the JIT is about to write up to `written`, which `committed`
+// already covers. Runs on the thread compiling into this cache (its guest core, or the precompile
+// thread at boot), between two blocks; it never waits for the lock and never for memory.
+void CommitAhead(CodeRange& range, std::size_t written, std::size_t committed) noexcept {
+    NeedServed(range); // the JIT writes on: a need of this cache that waited is over (one load if not)
+    range.written.store(written, std::memory_order_relaxed);
+    if (committed < CodeStep || committed >= range.span) return; // no step after the last
+    const std::size_t mark = committed - CodeStep + CodeStep * ahead_mark_pct.load(std::memory_order_relaxed) / 100;
+    if (written < mark) return;
+    if (range.ahead_for.load(std::memory_order_relaxed) != committed) {
+        range.ahead_for.store(committed, std::memory_order_relaxed);
+        range.ahead_skip.store(0, std::memory_order_relaxed);
+        range.ahead_checks.store(0, std::memory_order_relaxed);
+        range.ahead_room.store(false, std::memory_order_relaxed);
+        AheadAdd(kAheadCrossed);
+    }
+    const int mode = ahead_mode.load(std::memory_order_relaxed);
+    if (mode == 1 && range.ahead_room.load(std::memory_order_relaxed)) return; // counted once a step
+    if (const std::uint32_t skip = range.ahead_skip.load(std::memory_order_relaxed); skip != 0) {
+        range.ahead_skip.store(skip - 1, std::memory_order_relaxed);
+        return;
+    }
+    range.ahead_checks.fetch_add(1, std::memory_order_relaxed);
+    unsigned long long largest = 0;
+    std::size_t held = 0, target = 0;
+    const AheadRoom room = RoomForAhead(&largest, &held, &target);
+    if (room != AheadRoom::yes) {
+        AheadAdd(room == AheadRoom::largest   ? kAheadNoLargest
+                 : room == AheadRoom::reserve ? kAheadNoReserve
+                 : room == AheadRoom::waiting ? kAheadNoWaiting
+                                              : kAheadNoUnknown);
+        range.ahead_skip.store(AheadRecheckBlocks, std::memory_order_relaxed);
+        return;
+    }
+    const void* const code = reinterpret_cast<const void*>(range.executable.load(std::memory_order_relaxed));
+    const std::size_t room_bytes = ahead_room_bytes.load(std::memory_order_relaxed);
+    char line[288];
+    if (mode == 1) {
+        // Mode 2's rule for a step with nothing mapped ahead yet: room + the whole step.
+        if (largest != 0 && largest < room_bytes + CodeStep) {
+            AheadAdd(kAheadNoLargest);
+            range.ahead_skip.store(AheadRecheckBlocks, std::memory_order_relaxed);
+            return;
+        }
+        range.ahead_room.store(true, std::memory_order_relaxed);
+        AheadAdd(kAheadWould);
+        const int length = std::snprintf(
+            line, sizeof(line),
+            "EDEN_UP_JIT_COMMIT_AHEAD code=%p count only: would map the step to %zu of %zu MiB now (written %zu MiB; "
+            "pool largest free %llu MiB, needs %zu, reserve %zu of %zu blocks)\n",
+            code, (committed + CodeStep) >> 20, range.span >> 20, written >> 20, largest >> 20,
+            (room_bytes + CodeStep) >> 20, held / LargePage, target / LargePage);
+        if (length > 0) Report(line);
+        return;
+    }
+    std::unique_lock lock{code_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        AheadAdd(kAheadBusy);
+        range.ahead_skip.store(AheadBusyBlocks, std::memory_order_relaxed);
+        return;
+    }
+    if (range.committed.load(std::memory_order_relaxed) != committed) return; // made whole meanwhile
+    // Again under the lock, where a need is refused (CommitCodeRange): a need that waits now was
+    // refused before this look, and comes first.
+    if (code_needs_waiting.load(std::memory_order_acquire) != 0) {
+        AheadAdd(kAheadNoWaiting);
+        range.ahead_skip.store(AheadRecheckBlocks, std::memory_order_relaxed);
+        return;
+    }
+#ifdef PS5_NATIVE
+    // The full rule: the reading less what ahead took since, at least <room> plus what this step
+    // still has to map, so <room> stays free once the step is whole, whatever the reading's age.
+    const std::size_t mapped_of_step = range.pieces * LargePage > committed ? range.pieces * LargePage - committed : 0;
+    const std::size_t step_left = CodeStep > mapped_of_step ? CodeStep - mapped_of_step : 0;
+    const std::size_t taken_lately = CodeNowNs() - ahead_recent_ns <= 20'000'000ull ? ahead_recent_bytes : 0;
+    const unsigned long long usable = largest > taken_lately ? largest - taken_lately : 0;
+    if (usable < room_bytes + step_left) {
+        AheadAdd(kAheadNoLargest);
+        range.ahead_skip.store(AheadRecheckBlocks, std::memory_order_relaxed);
+        return;
+    }
+#endif
+    bool refused = false;
+    const bool whole = MapAheadLocked(range, committed, &refused);
+    if (refused) {
+        AheadAdd(kAheadRefused);
+        range.ahead_skip.store(AheadRecheckBlocks, std::memory_order_relaxed);
+        return;
+    }
+    range.ahead_room.store(true, std::memory_order_relaxed); // a block was mapped (not just looked at)
+    const std::size_t held_ahead = HeldAheadLocked();
+    for (std::size_t most = ahead_held_most.load(std::memory_order_relaxed);
+         held_ahead > most && !ahead_held_most.compare_exchange_weak(most, held_ahead, std::memory_order_relaxed);) {
+    }
+    if (!whole) return;
+    range.committed.store(committed + CodeStep, std::memory_order_release);
+    AheadAdd(kAheadSteps);
+    // The line the need prints (logs read the caches' size from it), then this one.
+    int length = std::snprintf(line, sizeof(line), "EDEN_JIT_MEMORY code=%p held=%zu of=%zu\n", code,
+                               committed + CodeStep, range.span);
+    if (length > 0) Report(line);
+    length = std::snprintf(line, sizeof(line),
+                           "EDEN_UP_JIT_COMMIT_AHEAD code=%p next step mapped ahead: holds %zu of %zu MiB, written %zu "
+                           "MiB; pool largest free %llu MiB, reserve %zu of %zu blocks; mapped ahead and not yet "
+                           "written, all caches: %zu MiB\n",
+                           code, (committed + CodeStep) >> 20, range.span >> 20, written >> 20, largest >> 20,
+                           held / LargePage, target / LargePage, held_ahead >> 20);
+    if (length > 0) Report(line);
+}
+
+// The need, with the switch on: the JIT is about to write past `committed` (code_mutex is held).
+// Counts the step and says when the ahead path had not made it in time.
+void AheadAtNeed(CodeRange& range, std::size_t written, std::size_t committed) noexcept {
+    range.written.store(written, std::memory_order_relaxed);
+    // A cache's first step, nothing to take, or this step counted already (the wait asks every 20 ms).
+    if (committed == 0 || written <= committed || range.need_for == committed) return;
+    range.need_for = committed;
+    AheadAdd(kAheadNeedSteps);
+#ifdef PS5_NATIVE
+    if (range.pieces > committed / LargePage) AheadAdd(kAheadNeedPartial);
+#endif
+    const bool seen = range.ahead_for.load(std::memory_order_relaxed) == committed;
+    if (seen && range.ahead_room.load(std::memory_order_relaxed)) return;
+    AheadAdd(kAheadNeedMissed);
+    char line[192];
+    const int length = std::snprintf(
+        line, sizeof(line), "EDEN_UP_JIT_COMMIT_AHEAD code=%p the step to %zu of %zu MiB is taken at the need: %s (%u looks)\n",
+        reinterpret_cast<const void*>(range.executable.load(std::memory_order_relaxed)), (committed + CodeStep) >> 20,
+        range.span >> 20, seen ? "no room since the mark" : "the mark was not seen",
+        range.ahead_checks.load(std::memory_order_relaxed));
+    if (length > 0) Report(line);
+}
 } // namespace
+
+// EDEN_UP_JIT_COMMIT_AHEAD, from main before the first cache (headless/heap_pages.cpp checks the values).
+void SetCodeCommitAhead(int mode, unsigned mark_pct, std::size_t room_mib) noexcept {
+    ahead_mark_pct.store(mark_pct, std::memory_order_relaxed);
+    ahead_room_bytes.store(room_mib << 20, std::memory_order_relaxed);
+    ahead_mode.store(mode, std::memory_order_relaxed);
+}
+} // namespace Common
+
+// The switch and the shared test hook for the 10 s line (headless/performance.cpp, RefreshFreeMemory):
+// 0 while neither is set. With the hook alone (a control arm) the line still gives its refusals.
+extern "C" int eden_jit_ahead_active(void) noexcept {
+    return Common::ahead_mode.load(std::memory_order_relaxed) != 0 ||
+           Common::refuse_left.load(std::memory_order_relaxed) != 0 ||
+           Common::refuse_done.load(std::memory_order_relaxed) != 0;
+}
+// values: the counts in AheadCount's order, then mapped ahead and not yet written now (bytes; ~0 when
+// the lock was busy), the most of that so far, test refusals left, the mark (%), the room (bytes).
+// Returns the mode. Any thread; tries the lock once, never waits.
+extern "C" int eden_jit_ahead_stats(unsigned long long* values, std::size_t count) noexcept {
+    using namespace Common;
+    unsigned long long v[kAheadCounts + 5] = {};
+    for (unsigned i = 0; i < kAheadCounts; ++i) v[i] = ahead_counts[i].load(std::memory_order_relaxed);
+    v[kAheadTestRefused] = refuse_done.load(std::memory_order_relaxed); // the shared hook's count
+    if (ahead_mode.load(std::memory_order_relaxed) != 0) { // off (the test alone): `written` is not kept
+        std::unique_lock lock{code_mutex, std::try_to_lock};
+        v[kAheadCounts] = lock.owns_lock() ? HeldAheadLocked() : ~0ULL;
+    }
+    v[kAheadCounts + 1] = ahead_held_most.load(std::memory_order_relaxed);
+    v[kAheadCounts + 2] = refuse_left.load(std::memory_order_relaxed);
+    v[kAheadCounts + 3] = ahead_mark_pct.load(std::memory_order_relaxed);
+    v[kAheadCounts + 4] = ahead_room_bytes.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < count && i < sizeof(v) / sizeof(v[0]); ++i) values[i] = v[i];
+    return ahead_mode.load(std::memory_order_relaxed);
+}
+
+namespace Common {
 
 // Address space for a code cache of `size` bytes: returns the range to write through and sets
 // the one to run from. Null when a cache this small is better taken whole, or when the
@@ -1231,6 +1713,13 @@ void* ReserveCodeRange(std::size_t size, void** executable) noexcept {
     free_range->span = size;
     free_range->committed.store(0, std::memory_order_relaxed);
     free_range->pieces = 0;
+    free_range->written.store(0, std::memory_order_relaxed);
+    free_range->ahead_for.store(0, std::memory_order_relaxed);
+    free_range->ahead_skip.store(0, std::memory_order_relaxed);
+    free_range->ahead_checks.store(0, std::memory_order_relaxed);
+    free_range->ahead_room.store(false, std::memory_order_relaxed);
+    free_range->need_for = 0;
+    free_range->need_waiting.store(false, std::memory_order_relaxed);
     free_range->executable.store(reinterpret_cast<std::uintptr_t>(views[1]), std::memory_order_release);
     code_reserved.fetch_add(size, std::memory_order_relaxed);
     *executable = views[1];
@@ -1245,14 +1734,24 @@ bool CommitCodeRange(const void* executable, std::size_t bytes) noexcept {
     for (auto& range : code_ranges) {
         if (address == 0 || range.executable.load(std::memory_order_acquire) != address) continue;
         if (bytes > range.span) bytes = range.span;
-        if (bytes <= range.committed.load(std::memory_order_acquire)) return true;
+        if (const std::size_t held = range.committed.load(std::memory_order_acquire); bytes <= held) {
+            // EDEN_UP_JIT_COMMIT_AHEAD (off: this one test of a value set at boot, per block).
+            if (ahead_mode.load(std::memory_order_relaxed) != 0) CommitAhead(range, bytes, held);
+            return true;
+        }
         const std::lock_guard lock{code_mutex};
         std::size_t committed = range.committed.load(std::memory_order_relaxed);
+        if (ahead_mode.load(std::memory_order_relaxed) != 0) AheadAtNeed(range, bytes, committed);
         while (committed < bytes) {
-            if (!CommitCodeStep(range, committed)) return false;
+            if (!CommitCodeStep(range, committed)) {
+                // EDEN_UP_JIT_COMMIT_AHEAD: this need now waits (commit() retries); ahead steps aside.
+                if (committed != 0 && ahead_mode.load(std::memory_order_relaxed) != 0) NeedRefused(range);
+                return false;
+            }
             committed += CodeStep;
             range.committed.store(committed, std::memory_order_release);
         }
+        if (ahead_mode.load(std::memory_order_relaxed) != 0) NeedServed(range);
         char line[112];
         const int length = std::snprintf(line, sizeof(line), "EDEN_JIT_MEMORY code=%p held=%zu of=%zu\n", executable,
                                          committed, range.span);
@@ -1280,10 +1779,18 @@ bool FreeCodeRange(void* executable) noexcept {
         code_reserved.fetch_sub(range.span, std::memory_order_relaxed);
         code_committed.fetch_sub(committed, std::memory_order_relaxed);
         range.committed.store(0, std::memory_order_relaxed);
+        NeedServed(range); // EDEN_UP_JIT_COMMIT_AHEAD: a need of a cache that is gone waits no more
         range.executable.store(0, std::memory_order_release);
         return true;
     }
     return false;
+}
+
+// EDEN_TEST_JIT_COMMIT_REFUSE, from main before the first cache (headless/heap_pages.cpp checks the values).
+void SetCodeCommitRefuse(unsigned long long count, unsigned after_s, unsigned where) noexcept {
+    refuse_where.store(where, std::memory_order_relaxed);
+    refuse_from_ns.store(CodeNowNs() + std::uint64_t{after_s} * 1000000000ull, std::memory_order_relaxed);
+    refuse_left.store(count, std::memory_order_relaxed);
 }
 
 // Address space the growing code caches span, and the memory behind them (for the log).
@@ -1292,3 +1799,32 @@ void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept {
     *committed = code_committed.load(std::memory_order_relaxed);
 }
 } // namespace Common
+
+// EDEN_UP_JIT_COMMIT_RECLAIM's compile scope and commit result, per thread (headless/memory_wait.h says
+// why they live here and not as inline thread_locals there). The only definition: dynarmic's allocator,
+// eden_jit_commit_scope and the hook above all reach this one copy through these calls.
+namespace Eden::MemoryWait {
+namespace {
+thread_local int jit_clear_scope = 0;
+thread_local int jit_commit_result = 0;
+} // namespace
+int JitClearScope() noexcept {
+    return jit_clear_scope;
+}
+void SetJitClearScope(int value) noexcept {
+    jit_clear_scope = value;
+}
+int JitCommitResult() noexcept {
+    return jit_commit_result;
+}
+void SetJitCommitResult(int value) noexcept {
+    jit_commit_result = value;
+}
+} // namespace Eden::MemoryWait
+
+// EDEN_TEST_JIT_COMMIT_REFUSE with <where> 4 (headless/performance.cpp, eden_jit_commit_scope): 1 when
+// GetBlock must open its compile scope for the hook even with EDEN_UP_JIT_COMMIT_RECLAIM unset.
+extern "C" int eden_jit_refuse_in_compile(void) noexcept {
+    return (Common::refuse_where.load(std::memory_order_relaxed) & Common::kRefuseInCompile) != 0 &&
+           Common::refuse_left.load(std::memory_order_relaxed) != 0;
+}
