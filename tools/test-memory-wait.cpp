@@ -181,7 +181,25 @@ static void TwoNames() {
     CHECK(counters.longest_ms.load() == 40);
 }
 
+// EDEN_UP_NEW_WAIT_BUILDER_SKIP (waveydude's c2eb4e4 HandlerLimit test): no handler wait on a thread
+// that builds pipelines (his W-05, in a later area: 16 MiB and 11.4 MiB waited 5 s for nothing), nor for a
+// request no wait can serve; every other thread keeps its wait. With the switch off main passes false.
+static void HandlerLimit() {
+    CHECK(HandlerLimitMs(16777216, 5000, true) == 0);
+    CHECK(HandlerLimitMs(11960320, 5000, true) == 0);
+    CHECK(HandlerLimitMs(16777216, 5000, false) == 5000);
+    CHECK(HandlerLimitMs(32435200, 2000, false) == 2000);
+    CHECK(HandlerLimitMs(std::uint64_t{2} << 40, 5000, false) == 0);
+    CHECK(HandlerLimitMs(std::uint64_t{2} << 40, 5000, true) == 0);
+    CHECK(HandlerLimitMs(4096, 0, false) == 0);
+    // A limit of 0 gives up at once and starts no cooldown.
+    Episode episode;
+    CHECK(Next(episode, 1000, HandlerLimitMs(16777216, 5000, true), 16777216) == Step::GiveUp);
+    CHECK(!episode.active && episode.cooldown_until_ms == 0);
+}
+
 int main() {
+    HandlerLimit();
     Parse();
     TwoNames();
     HopelessRequests();

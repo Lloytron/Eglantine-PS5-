@@ -133,6 +133,24 @@ inline bool WorthWaitingFor(std::uint64_t bytes) {
     return bytes <= LargestWaitedRequest;
 }
 
+// Port of waveydude's Eglantine-PS5- c2eb4e4 (Wave W-05), as our switch EDEN_UP_NEW_WAIT_BUILDER_SKIP=1
+// (exact 1; unset: as T181). The handler's limit for one refused request: no wait of its own for a
+// request no wait can serve, nor (switch on) on a thread that builds pipelines: a "VkPipeline..."
+// builder or a thread inside a run-time pipeline build (heap_arenas.inc
+// eden_heap_thread_builds_pipelines). The heap already waits for those threads
+// (EDEN_UP_HEAP_WAIT_MS, EDEN_UP_HEAP_WAIT_GPU_MS), and a build that finds no memory fails its
+// pipeline and the picture goes on, so EDEN_UP_NEW_WAIT_MS more there is that long a still picture.
+// His W-05, in a later area: two builds waited the handler's whole 5 s for 16 MiB and 11.4 MiB, got nothing,
+// and the picture stood still 3.98 s and 6.80 s. Our play env sets EDEN_UP_NEW_WAIT_MS=2000.
+// A limit of 0 gives up at once (Next) and starts no cooldown.
+// T183d check: a thread counts only while the heap really waits for it: a "VkPipeline..." thread with
+// EDEN_UP_HEAP_WAIT_MS set, a run-time build with EDEN_UP_HEAP_WAIT_GPU_MS set (play env v39 sets only
+// the first, so the GPU thread keeps the handler's wait there).
+inline std::atomic<bool> builder_skip{false};
+inline unsigned HandlerLimitMs(std::uint64_t bytes, unsigned configured_ms, bool builds_pipelines) {
+    return WorthWaitingFor(bytes) && !builds_pipelines ? configured_ms : 0;
+}
+
 // EDEN_UP_DOOR_WAIT=1 (0597, our own; headless/main.cpp DoorWait). On a cold first start two
 // pipeline builder jobs take 400-800 MiB of heap within about 2 s, twice, and give it back about 2 s
 // later; a refused operator new on the file-service thread meanwhile gave up after
@@ -185,6 +203,8 @@ struct Counters {
                                                      // its last call came within SameRequestGapMs
     std::atomic<unsigned long long> cooldown{0};     // refusals thrown at once in a cooldown
     std::atomic<unsigned long long> too_big{0};      // refusals over LargestWaitedRequest, thrown at once
+    std::atomic<unsigned long long> builder{0};      // EDEN_UP_NEW_WAIT_BUILDER_SKIP: refusals on a pipeline-
+                                                     // building thread thrown at once, no handler wait
     std::atomic<unsigned> waiting{0};                // threads inside a 20 ms sleep now
     std::atomic<unsigned> longest_ms{0};             // T130: most ms one wait really slept (20 per step)
 };

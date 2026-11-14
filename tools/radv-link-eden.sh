@@ -17,13 +17,18 @@ eden_radv_link_recipe() {
     radv_link_inputs=("${inputs[@]}")
     # The platform layer wraps fclose and fflush (its open_memstream) and headless/nfs/nfs.cpp wraps them too: the
     # platform's two are kept in a copy of the archive under other names, which nfs.cpp calls for every FILE that
-    # is not one of its own.
+    # is not one of its own. Its thread wraps (2 MiB stacks in direct memory) are kept the same way, as
+    # ps5_platform_pthread_create/join/detach: src/host_stacks.c defines the wraps and calls them
+    # (EDEN_UP_HOST_STACK_KIB; switch off, every call goes straight on to the platform's).
     local platform_archive="$root/build/libps5platform-nfs.a" i
     mkdir -p "$root/build"
     cp "$radv_sdk/target/lib/libps5platform.a" "$platform_archive"
     "$(command -v llvm-objcopy-18 || command -v llvm-objcopy)" \
         --redefine-sym __wrap_fclose=ps5_memstream_fclose \
-        --redefine-sym __wrap_fflush=ps5_memstream_fflush "$platform_archive"
+        --redefine-sym __wrap_fflush=ps5_memstream_fflush \
+        --redefine-sym __wrap_pthread_create=ps5_platform_pthread_create \
+        --redefine-sym __wrap_pthread_join=ps5_platform_pthread_join \
+        --redefine-sym __wrap_pthread_detach=ps5_platform_pthread_detach "$platform_archive"
     for i in "${!radv_link_inputs[@]}"; do
         [[ ${radv_link_inputs[i]} == "$radv_sdk/target/lib/libps5platform.a" ]] && radv_link_inputs[i]="$platform_archive"
     done

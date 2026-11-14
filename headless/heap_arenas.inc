@@ -4664,6 +4664,42 @@ int eden_door_may_wait(char out[16]) {
   return may;
 }
 
+/* EDEN_UP_NEW_WAIT_BUILDER_SKIP (port of waveydude's Eglantine-PS5- c2eb4e4, Wave W-05; memory_wait.h
+ * HandlerLimitMs): 1 when the heap itself waits for this thread's requests, a pipeline builder
+ * ("VkPipeline..." by the name on its record) or a thread inside a run-time pipeline build
+ * (eden_heap_wait_scope), so operator new's handler adds no wait of its own there; each only while its
+ * heap wait is set (EDEN_UP_HEAP_WAIT_MS, EDEN_UP_HEAP_WAIT_GPU_MS), else 0 (T183d check). `out` (16 bytes,
+ * may be NULL): the thread's name for the EDEN_NEW_WAIT / EDEN_HEAP_FAILURE lines, "?" when none.
+ * Reads this thread's own record without claiming one, as eden_door_may_wait does. Called only with
+ * the switch on. */
+int eden_heap_thread_builds_pipelines(char out[16]) {
+  char name[16] = {0};
+  int builds = 0;
+  if (eden_heap_arena_key_valid) {
+    const struct eden_heap_thread *self = pthread_getspecific(eden_heap_arena_key);
+    if (self != NULL) {
+      for (unsigned i = 0; i < sizeof(name); ++i)
+        name[i] = __atomic_load_n(&self->name[i], __ATOMIC_RELAXED);
+      name[sizeof(name) - 1] = 0;
+      /* T183d check: only where the heap really waits for this thread (his premise). Play env v39
+       * sets EDEN_UP_HEAP_WAIT_MS but not EDEN_UP_HEAP_WAIT_GPU_MS: without this, the GPU thread
+       * inside a run-time build would lose its only wait, and parts of that build (environments,
+       * the kept-store path) catch no std::bad_alloc. */
+      if (strncmp(name, "VkPipeline", 10) == 0)
+        builds = atomic_load_explicit(&eden_heap_wait_ms, memory_order_relaxed) != 0;
+      else if (self->wait_scope != 0)
+        builds = atomic_load_explicit(&eden_heap_wait_gpu_ms, memory_order_relaxed) != 0;
+    }
+  }
+  if (name[0] == 0) {
+    name[0] = '?';
+    name[1] = 0;
+  }
+  if (out)
+    memcpy(out, name, sizeof(name));
+  return builds;
+}
+
 void eden_heap_wait_stats(unsigned long long *count, unsigned long long *total_ms, unsigned *longest_ms,
                           unsigned long long *lost) {
   *count = atomic_load_explicit(&eden_heap_wait_count, memory_order_relaxed);

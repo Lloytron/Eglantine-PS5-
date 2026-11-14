@@ -2808,6 +2808,9 @@ void Initialize() {
         set_property(TARGET eden-headless APPEND PROPERTY LINK_DEPENDS
             "${PORT_ROOT}/tools/radv-link-eden.sh"
             "${PORT_ROOT}/../mihawk-vulkan-review/tools/radv-link.sh")
+        # EDEN_UP_HOST_STACK_KIB: takes the place of the RADV platform's thread wraps, which
+        # tools/radv-link-eden.sh renames to ps5_platform_pthread_* (only with that platform).
+        target_sources(eden-headless PRIVATE "${PORT_ROOT}/src/host_stacks.c")
     endif()
     target_compile_definitions(common PRIVATE PS5_NATIVE=1)
 else()

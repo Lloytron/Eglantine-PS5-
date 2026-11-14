@@ -855,6 +855,8 @@ extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long
 extern "C" int eden_direct_ledger_exact(unsigned long long* pieces, unsigned long long* unmatched,
                                         unsigned long long* unmatched_bytes,
                                         unsigned long long* untracked) __attribute__((weak));
+// EDEN_UP_HOST_STACK_KIB (src/host_stacks.c): 0 when off or not in this build.
+extern "C" int eden_host_stacks_report(char* line, std::size_t size) __attribute__((weak));
 // EDEN_UP_SHADER_SET (video_core/shader_set.cpp, FreeMemoryBytes): the free memory its extraction
 // and preparation stop below. This kernel has no vm.stats sysctl counters; the largest free block
 // of the pool is what the caches here go by too (RefreshFreeMemory). 0: not known.
@@ -899,6 +901,9 @@ static void ReportLedger() {
     if (eden_direct_ledger_exact && eden_direct_ledger_exact(&pieces, &unmatched, &unmatched_bytes, &untracked)) {
         std::fprintf(stderr, "EDEN_POOL_LEDGER_EXACT pieces=%llu unmatched=%llu (%llu MiB) untracked=%llu\n", pieces,
                      unmatched, unmatched_bytes >> 20, untracked);
+    }
+    if (char line[256]; eden_host_stacks_report && eden_host_stacks_report(line, sizeof(line))) {
+        std::fprintf(stderr, "%s\n", line);
     }
     // RADV_PS5_MEMORY_REPORT=1: out of the pool, less the owners above, less this, is the driver's
     // own buffers and the rest, every 20 s and not only at a refusal. Without it nothing here runs:
@@ -1128,19 +1133,24 @@ static void ReportNewWait(long long now) {
     const unsigned long long cooldown = c.cooldown.load(std::memory_order_relaxed);
     const unsigned long long too_big = c.too_big.load(std::memory_order_relaxed);
     const unsigned long long at_once = c.at_once.load(std::memory_order_relaxed);
-    const unsigned long long sum = begun + gave_up + steps + cooldown + too_big + at_once;
+    const unsigned long long builder = c.builder.load(std::memory_order_relaxed);  // 0 unless EDEN_UP_NEW_WAIT_BUILDER_SKIP
+    const unsigned long long sum = begun + gave_up + steps + cooldown + too_big + at_once + builder;
     if (sum == reported_sum.load(std::memory_order_relaxed) ||
         !reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed))
         return;
     reported_sum.store(sum, std::memory_order_relaxed);
+    // EDEN_UP_NEW_WAIT_BUILDER_SKIP=1: refusals on pipeline-building threads thrown with no handler wait.
+    char builder_text[64] = "";
+    if (MemoryWait::builder_skip.load(std::memory_order_relaxed))
+        std::snprintf(builder_text, sizeof(builder_text), ", pipeline-building thread %llu", builder);
     std::fprintf(stderr,
                  "EDEN_UP_NEW_WAIT limit=%u ms waits begun %llu, gave up %llu, not given up %llu (other size within "
                  "60 s %llu); 20 ms steps %llu (%llu ms asleep in all), heap trims %llu, longest %u ms asleep, waiting "
-                 "now %u; thrown at once: same size again within 60 s %llu, cooldown %llu, over 1 GiB %llu\n",
+                 "now %u; thrown at once: same size again within 60 s %llu, cooldown %llu, over 1 GiB %llu%s\n",
                  MemoryWait::new_wait_ms.load(std::memory_order_relaxed), begun, gave_up,
                  begun >= gave_up ? begun - gave_up : 0ULL, c.other_size.load(std::memory_order_relaxed), steps,
                  steps * 20, c.trims.load(std::memory_order_relaxed), c.longest_ms.load(std::memory_order_relaxed),
-                 c.waiting.load(std::memory_order_relaxed), at_once, cooldown, too_big);
+                 c.waiting.load(std::memory_order_relaxed), at_once, cooldown, too_big, builder_text);
 }
 // EDEN_UP_JIT_COMMIT_AHEAD and its test (src/memory_pages.cpp): from RefreshFreeMemory (every 100 ms at
 // most, on the GPU thread) while either is set. Its counters every 10 s, when one has moved. "Mapped ahead,

@@ -36,6 +36,8 @@ extern "C" void eden_heap_long_lived_report(const char* why) __attribute__((weak
 extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 // EDEN_POOL_LEDGER_EXACT=1 (src/direct_memory.c), decided once env.txt is applied.
 extern "C" void eden_direct_ledger_exact_init(void) __attribute__((weak));
+// EDEN_UP_HOST_STACK_KIB=<256|512|1024> (src/host_stacks.c; only in a RADV build).
+extern "C" void eden_host_stacks_init(void) __attribute__((weak));
 // EDEN_UP_BIG_STACKS (headless/heap_arenas.inc): text for operator new's failure lines, 0 when off.
 // big_row= names this thread's last refused request only when it is `requested` (else none).
 extern "C" unsigned eden_big_failure_text(char* out, unsigned size, unsigned long long requested) __attribute__((weak));
@@ -43,6 +45,9 @@ extern "C" unsigned eden_big_failure_text(char* out, unsigned size, unsigned lon
 // may wait for them; eden_heap_want: a request waits (the caches see memory short).
 extern "C" unsigned eden_door_jobs(unsigned long long* ended, unsigned long long* since_end_ms) __attribute__((weak));
 extern "C" int eden_door_may_wait(char* name16) __attribute__((weak));
+// EDEN_UP_NEW_WAIT_BUILDER_SKIP (waveydude's c2eb4e4, headless/heap_arenas.inc): whether the heap itself
+// waits for this thread (a pipeline builder, or inside a run-time build), and the thread's name.
+extern "C" int eden_heap_thread_builds_pipelines(char* name16) __attribute__((weak));
 extern "C" void eden_heap_want(int enter) __attribute__((weak));
 // EDEN_UP_BUILD_GIVE_BACK (0598, headless/heap_arenas.inc): empty heap spaces back to the pool when the
 // last builder job in flight ends.
@@ -555,7 +560,19 @@ int main(int argc, char** argv) {
                 // from a wait that ran out.
                 thread_local std::uint64_t episode_asleep_ms = 0;
                 const bool worth = MemoryWait::WorthWaitingFor(bytes);
-                const unsigned limit = worth ? wait_ms : 0;
+                // EDEN_UP_NEW_WAIT_BUILDER_SKIP=1 (waveydude's c2eb4e4, memory_wait.h HandlerLimitMs):
+                // no handler wait on a thread that builds pipelines; the thread named in the lines.
+                // Off: no call, limit as T181.
+                const bool skip_on = MemoryWait::builder_skip.load(std::memory_order_relaxed) &&
+                                     eden_heap_thread_builds_pipelines != nullptr;
+                char thread_tag[24] = "";
+                bool builds_pipelines = false;
+                if (skip_on) {
+                    char name[16] = "?";
+                    builds_pipelines = eden_heap_thread_builds_pipelines(name) != 0;
+                    std::snprintf(thread_tag, sizeof(thread_tag), " thread=%s", name);
+                }
+                const unsigned limit = MemoryWait::HandlerLimitMs(bytes, wait_ms, builds_pipelines);
                 const auto now = static_cast<std::uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
@@ -572,8 +589,8 @@ int main(int argc, char** argv) {
                             counters.other_size.fetch_add(1, std::memory_order_relaxed);
                         char big[256];  // EDEN_UP_BIG_STACKS: "" when off
                         if (!eden_big_failure_text || eden_big_failure_text(big, sizeof(big), bytes) == 0) big[0] = '\0';
-                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u%s\n",
-                                     bytes, reason, limit, big);
+                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u%s%s\n",
+                                     bytes, reason, limit, thread_tag, big);
                     }
                     if (MemoryWait::TrimNow(episode, step, now) && eden_heap_trim) {
                         counters.trims.fetch_add(1, std::memory_order_relaxed);
@@ -589,6 +606,11 @@ int main(int argc, char** argv) {
                 }
                 if (!worth) {
                     counters.too_big.fetch_add(1, std::memory_order_relaxed);
+                } else if (builds_pipelines) {
+                    // EDEN_UP_NEW_WAIT_BUILDER_SKIP: thrown at once, no cooldown started (limit 0);
+                    // the heap's own wait for this thread has run already. Counted, no line here: the
+                    // EDEN_HEAP_FAILURE line below names the thread.
+                    counters.builder.fetch_add(1, std::memory_order_relaxed);
                 } else if (episode.cooldown_until_ms == now + MemoryWait::CooldownMs && !in_cooldown &&
                            now - last_call > MemoryWait::try_bound_ms.load(std::memory_order_relaxed)) {
                     // His 60 s same-size rule joined this refusal to the wait before it, and the pause
@@ -618,8 +640,15 @@ int main(int argc, char** argv) {
             }
             char big[256];  // EDEN_UP_BIG_STACKS: this request's row and who grew the heap; "" when off
             if (!eden_big_failure_text || eden_big_failure_text(big, sizeof(big), bytes) == 0) big[0] = '\0';
-            std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu%s\n", bytes,
-                         reason, count, big);
+            // EDEN_UP_NEW_WAIT_BUILDER_SKIP=1: the failing thread's name (waveydude's c2eb4e4); off: "".
+            char failed_on[24] = "";
+            if (Eden::MemoryWait::builder_skip.load(std::memory_order_relaxed) && eden_heap_thread_builds_pipelines) {
+                char name[16] = "?";
+                (void)eden_heap_thread_builds_pipelines(name);
+                std::snprintf(failed_on, sizeof(failed_on), " thread=%s", name);
+            }
+            std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu%s%s\n", bytes,
+                         reason, count, failed_on, big);
             ps5_opengl_heap_snapshot("allocation_failure", 0);
             std::fflush(stdout);
             Eden::Report("allocation failure", "operator new: heap exhausted");
@@ -856,6 +885,7 @@ int main(int argc, char** argv) {
         // now, with the environment complete and the pool still whole (headless/heap_pages.cpp).
         if (eden_heap_pool_init) eden_heap_pool_init();
         if (eden_direct_ledger_exact_init) eden_direct_ledger_exact_init();
+        if (eden_host_stacks_init) eden_host_stacks_init();
         // Test runs (test_harness.h): nothing happens here without an EDEN_TEST_ setting.
         Eden::TestHarness::Start();
         if (const std::string& title = Eden::TestHarness::BootTitle(); !title.empty()) {
@@ -1136,6 +1166,19 @@ int main(int argc, char** argv) {
         if (const unsigned wait = Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed)) {
             std::printf("EDEN_UP_NEW_WAIT_MS=%u: operator new waits that long for memory before it gives up\n",
                         wait);
+        }
+        // EDEN_UP_NEW_WAIT_BUILDER_SKIP=1 (exact 1; port of waveydude's Eglantine-PS5- c2eb4e4, Wave
+        // W-05; memory_wait.h HandlerLimitMs): operator new's handler adds no EDEN_UP_NEW_WAIT_MS wait on
+        // a pipeline builder or a thread inside a run-time build, and names the thread in the
+        // EDEN_NEW_WAIT start / EDEN_HEAP_FAILURE lines. Unset: as T181.
+        if (Common::PeSwitch("EDEN_UP_NEW_WAIT_BUILDER_SKIP")) {
+            if (eden_heap_thread_builds_pipelines) {
+                Eden::MemoryWait::builder_skip.store(true, std::memory_order_relaxed);
+                std::fprintf(stderr, "EDEN_UP_NEW_WAIT_BUILDER_SKIP on new_wait_ms=%u\n",
+                             Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed));
+            } else {
+                std::fprintf(stderr, "EDEN_UP_NEW_WAIT_BUILDER_SKIP off reason=no_heap_hooks\n");
+            }
         }
         // EDEN_UP_DOOR_WAIT=1 (0597, memory_wait.h; exact 1): EDEN_UP_DOOR_WAIT_MAX_MS, unset 15000, held
         // within 1000..30000. The builder job count comes from the core's scope (vk_door_job.h), which
