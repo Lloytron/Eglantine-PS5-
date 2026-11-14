@@ -8,14 +8,25 @@
 // pixel has its origin at the bottom left; seconds counts from the start of loading. With 1000
 // added to it nothing on the screen moves (Settings > Accessibility, reduced motion).
 // state comes from hud.h (Loading::State): the step the start is at (1 to 4, 0 before the first),
-// the progress in thousandths, the shaders built and their total, and the seconds the step has
-// lasted.
+// the progress in thousandths, the shaders built and their total, the seconds the step has
+// lasted, and while the shader set is prepared before play (EDEN_UP_SHADER_SET_PREPASS): records
+// a second, minutes left plus one, and 1. Words 8-13 (core 0833): the part of that pass the screen
+// names (0: none; 1 reading the game's shaders, 2 creating the shader list, 3 storing it, 4 sorting
+// it against what is ready, 5 preparing shaders; T175d: 6 storing the driver's shader cache, with
+// word 9 its seconds), its done and total, its units a second, minutes to go plus one, and its
+// percentage.
 
 const vec3 kLime = vec3(0.89, 0.23, 0.38);  // the rose's petal-tip pink
 const vec3 kGreen = vec3(0.48, 0.12, 0.24); // deep rose
 const int kLineBrand = 0; // then the four steps: kLine[step]
 const int kLineLoading = 5;
 const int kLineSeconds = 6;
+const int kLinePart = 7;  // the parts' names: kLinePart + part - 1 (core 0833)
+const int kLineMb = 12;   // "MB", after the storing count
+const int kLineToGo = 13; // "MIN TO GO"
+const int kLineCache = 14; // T175d: "STORING THE SHADER CACHE" (part 6, EDEN_UP_BOOT_CACHE_TEXT=1)
+// Glyphs the figures use (indexes into loading_text.glsl's table, which is sorted).
+const int kGlyphS = 15, kGlyphM = 10, kGlyphI = 8, kGlyphN = 11;
 // The inks of the lettering; from kInkLime on they are lime, before it white.
 const int kInkBrand = 0, kInkDone = 1, kInkNow = 2, kInkLater = 3, kInkWord = 4, kInkFigure = 5, kInkLime = 6,
           kInkLimeDim = 7;
@@ -180,15 +191,68 @@ vec3 loading_scene(vec2 pixel, vec2 size, float seconds, uint state[24])
     // ---- above the bar: the word on the left, the figure on the right ----
     float baseline = 196.0 * unit;
     float small = 15.0 * unit;
-    pick_line(pick, kLineLoading, kInkWord, pixel, vec2(left, baseline), small, 0.34);
+    // Core 0833: while a part of the before-play pass runs, its name instead of the word.
+    int part = int(min(state[8], 6u));
+    int word_line = step == 3 && part == 6 ? kLineCache : step == 3 && part > 0 ? kLinePart + part - 1 : kLineLoading;
+    pick_line(pick, word_line, kInkWord, pixel, vec2(left, baseline), small, 0.34);
     float percent_step = pen_step(kPercent, 34.0 * unit, 0.04);
     if (pixel.y > baseline - 14.0 * unit && pixel.y < baseline + 48.0 * unit)
         pick_glyph(pick, kPercent, kInkFigure, pixel, vec2(right - percent_step, baseline), 34.0 * unit, 0.04);
     pick_number(pick, uint(progress * 100.0 + 0.001), kInkFigure, pixel, vec2(right - percent_step, baseline),
                 34.0 * unit, 0.04);
     // Beside the word: the shaders built of their total, or the seconds a slow step has lasted.
-    float detail_at = left + line_width(kLineLoading, small, 0.34) + 26.0 * unit;
-    if (step == 3 && state[3] > 0u)
+    float detail_at = left + line_width(word_line, small, 0.34) + 26.0 * unit;
+    bool on_line = pixel.y > baseline - 0.4 * small && pixel.y < baseline + 1.4 * small;
+    if (step == 3 && part == 6)
+    {
+        // T175d: the driver's caches being written: the seconds so far (word 9).
+        float number_to = detail_at + number_width(state[9], small, 0.10);
+        pick_number(pick, state[9], kInkLime, pixel, vec2(number_to, baseline), small, 0.10);
+        pick_line(pick, kLineSeconds, kInkLime, pixel, vec2(number_to + 6.0 * unit, baseline), small, 0.0);
+    }
+    else if (step == 3 && part > 0 && state[10] > 0u)
+    {
+        // The part's "<done> / <total> [MB]  <n>%  <rate>/S  <minutes> MIN TO GO".
+        float done_to = detail_at + number_width(state[9], small, 0.10);
+        float slash_at = done_to + 7.0 * unit;
+        float total_to = slash_at + pen_step(kSlash, small, 0.0) + 7.0 * unit + number_width(state[10], small, 0.10);
+        pick_number(pick, state[9], kInkLime, pixel, vec2(done_to, baseline), small, 0.10);
+        if (on_line)
+            pick_glyph(pick, kSlash, kInkLimeDim, pixel, vec2(slash_at, baseline), small, 0.0);
+        pick_number(pick, state[10], kInkLimeDim, pixel, vec2(total_to, baseline), small, 0.10);
+        float pen = total_to;
+        if (part == 3)
+        {
+            pen += 9.0 * unit;
+            pick_line(pick, kLineMb, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.10);
+            pen += line_width(kLineMb, small, 0.10);
+        }
+        float percent_to = pen + 34.0 * unit + number_width(state[13], small, 0.10);
+        pick_number(pick, state[13], kInkLime, pixel, vec2(percent_to, baseline), small, 0.10);
+        pen = percent_to + 3.0 * unit;
+        if (on_line)
+            pick_glyph(pick, kPercent, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.0);
+        pen += pen_step(kPercent, small, 0.0);
+        if (state[11] > 0u)
+        {
+            float rate_to = pen + 34.0 * unit + number_width(state[11], small, 0.10);
+            pick_number(pick, state[11], kInkLime, pixel, vec2(rate_to, baseline), small, 0.10);
+            pen = rate_to + 5.0 * unit;
+            if (on_line)
+                pick_glyph(pick, kSlash, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.0);
+            pen += pen_step(kSlash, small, 0.0) + 3.0 * unit;
+            if (on_line)
+                pick_glyph(pick, kGlyphS, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.10);
+            pen += pen_step(kGlyphS, small, 0.10);
+            if (state[12] > 0u)
+            {
+                float minutes_to = pen + 34.0 * unit + number_width(state[12] - 1u, small, 0.10);
+                pick_number(pick, state[12] - 1u, kInkLime, pixel, vec2(minutes_to, baseline), small, 0.10);
+                pick_line(pick, kLineToGo, kInkLimeDim, pixel, vec2(minutes_to + 7.0 * unit, baseline), small, 0.10);
+            }
+        }
+    }
+    else if (step == 3 && state[3] > 0u)
     {
         float built_to = detail_at + number_width(state[2], small, 0.10);
         float slash_at = built_to + 7.0 * unit;
@@ -197,6 +261,33 @@ vec3 loading_scene(vec2 pixel, vec2 size, float seconds, uint state[24])
         if (pixel.y > baseline - 0.4 * small && pixel.y < baseline + 1.4 * small)
             pick_glyph(pick, kSlash, kInkLimeDim, pixel, vec2(slash_at, baseline), small, 0.0);
         pick_number(pick, state[3], kInkLimeDim, pixel, vec2(total_to, baseline), small, 0.10);
+        if (state[7] == 1u && state[5] > 0u)
+        {
+            // The shader set's prepass: "<rate>/s  <minutes> min" after the count.
+            float rate_to = total_to + 34.0 * unit + number_width(state[5], small, 0.10);
+            pick_number(pick, state[5], kInkLime, pixel, vec2(rate_to, baseline), small, 0.10);
+            float pen = rate_to + 5.0 * unit;
+            if (on_line)
+                pick_glyph(pick, kSlash, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.0);
+            pen += pen_step(kSlash, small, 0.0) + 3.0 * unit;
+            if (on_line)
+                pick_glyph(pick, kGlyphS, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.10);
+            pen += pen_step(kGlyphS, small, 0.10);
+            if (state[6] > 0u)
+            {
+                float minutes_to = pen + 34.0 * unit + number_width(state[6] - 1u, small, 0.10);
+                pick_number(pick, state[6] - 1u, kInkLime, pixel, vec2(minutes_to, baseline), small, 0.10);
+                pen = minutes_to + 7.0 * unit;
+                if (on_line)
+                {
+                    pick_glyph(pick, kGlyphM, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.10);
+                    pen += pen_step(kGlyphM, small, 0.10);
+                    pick_glyph(pick, kGlyphI, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.10);
+                    pen += pen_step(kGlyphI, small, 0.10);
+                    pick_glyph(pick, kGlyphN, kInkLimeDim, pixel, vec2(pen, baseline), small, 0.10);
+                }
+            }
+        }
     }
     else if (state[4] >= 20u)
     {

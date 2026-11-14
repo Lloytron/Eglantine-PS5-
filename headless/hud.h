@@ -101,18 +101,91 @@ namespace Loading {
 enum class Step : uint32_t { none, game, graphics, shaders, starting };
 inline std::atomic<uint32_t> step{0}, built{0}, total{0};
 inline std::atomic<int64_t> since{0};  // when the step began, in milliseconds
+// EDEN_UP_SHADER_SET_PREPASS (core patch 0770): the shader set's records are prepared before the
+// game starts; built/total then count them, and the screen adds records a second and minutes left.
+inline std::atomic<uint32_t> preparing{0}, prepare_from{0};
+inline std::atomic<int64_t> prepare_began{0};
+// core patch 0833: the before-play pass's slow parts, each with its own count, in the order they
+// run. The screen names the part instead of "LOADING" and shows done / total, the percentage, a
+// rate and the minutes to go (loading_scene.glsl). `prepass` (EDEN_UP_SHADER_SET_PREPASS=1, set
+// by main.cpp before the shaders step) gives the boot pipelines only the first tenth of the
+// shaders step's bar, so the parts that follow still move it.
+// T175d (EDEN_UP_BOOT_CACHE_TEXT=1): `cache`, the driver's caches written before the game starts
+// (vulkan_pipelines.bin and the driver's drain): the screen names it and counts its seconds.
+enum class Part : uint32_t { none, files, records, save, count, preparing, cache };
+inline std::atomic<uint32_t> part{0}, part_done{0}, part_total{0}, part_from{0}, prepass{0};
+inline std::atomic<int64_t> part_since{0};
 inline int64_t Now() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 inline void Set(Step next) {
-    if (next <= Step::game) built = total = 0;
+    if (next <= Step::game) built = total = preparing = part = 0;
     since.store(Now(), std::memory_order_relaxed);
     step.store(static_cast<uint32_t>(next), std::memory_order_relaxed);
 }
 inline void Shaders(size_t done, size_t of) {
     built.store(static_cast<uint32_t>(done), std::memory_order_relaxed);
     total.store(static_cast<uint32_t>(of), std::memory_order_relaxed);
+}
+// A part of the before-play pass (core 0833) is at done of `of`.
+inline void Parts(Part now_at, size_t done, size_t of) {
+    const auto at = static_cast<uint32_t>(now_at);
+    part_done.store(static_cast<uint32_t>(done), std::memory_order_relaxed);
+    part_total.store(static_cast<uint32_t>(of), std::memory_order_relaxed);
+    if (part.load(std::memory_order_relaxed) != at) {
+        part_from.store(static_cast<uint32_t>(done), std::memory_order_relaxed);
+        part_since.store(Now(), std::memory_order_relaxed);
+        part.store(at, std::memory_order_relaxed);
+    }
+}
+inline void Prepared(size_t done, size_t of) {
+    if (!preparing.exchange(1, std::memory_order_relaxed)) {
+        prepare_from.store(static_cast<uint32_t>(done), std::memory_order_relaxed);
+        prepare_began.store(Now(), std::memory_order_relaxed);
+    }
+    Shaders(done, of);
+    Parts(Part::preparing, done, of);
+}
+// The part the screen names (core 0833). A part is first named once it has lasted 1.5 s, so a
+// start that skips the pass, or whose parts end at once, shows no part at all (no flash); after
+// that the screen follows the parts as they come.
+inline uint32_t ShownPart(int64_t now) {
+    static uint32_t shown = 0;
+    const uint32_t at = part.load(std::memory_order_relaxed);
+    if (at == 0 || step.load(std::memory_order_relaxed) != static_cast<uint32_t>(Step::shaders)) {
+        shown = 0;
+    } else if (shown != 0 || now - part_since.load(std::memory_order_relaxed) >= 1500) {
+        shown = at;
+    }
+    return shown;
+}
+// The part's pace: units a second since the part began (0 for its first 5 s: not known yet),
+// the minutes to go at that rate plus one (0: not known), and its percentage.
+inline std::array<uint32_t, 3> PartPace(int64_t now) {
+    const uint32_t done = part_done.load(std::memory_order_relaxed);
+    const uint32_t of = part_total.load(std::memory_order_relaxed);
+    const uint32_t percent = of ? static_cast<uint32_t>(std::min<uint64_t>(100, uint64_t{done} * 100 / of)) : 0;
+    const double seconds = static_cast<double>(now - part_since.load(std::memory_order_relaxed)) / 1000.0;
+    const uint32_t from = std::min(part_from.load(std::memory_order_relaxed), done);
+    if (seconds < 5.0 || done <= from) return {0, 0, percent};
+    const double rate = static_cast<double>(done - from) / seconds;
+    const double minutes = static_cast<double>(of > done ? of - done : 0) / rate / 60.0;
+    return {static_cast<uint32_t>(std::clamp(rate + 0.5, 1.0, 999999.0)),
+            1 + static_cast<uint32_t>(std::clamp(minutes + 0.5, 0.0, 99999.0)), percent};
+}
+// Records a second since the prepass began (0 for its first 5 s: not known yet) and the minutes
+// left at that rate, plus one (0: not known).
+inline std::array<uint32_t, 2> PreparePace(int64_t now) {
+    if (!preparing.load(std::memory_order_relaxed)) return {0, 0};
+    const double seconds = static_cast<double>(now - prepare_began.load(std::memory_order_relaxed)) / 1000.0;
+    const uint32_t done = built.load(std::memory_order_relaxed), of = total.load(std::memory_order_relaxed);
+    const uint32_t from = std::min(prepare_from.load(std::memory_order_relaxed), done);
+    if (seconds < 5.0 || done <= from) return {0, 0};
+    const double rate = static_cast<double>(done - from) / seconds;
+    const double minutes = static_cast<double>(of > done ? of - done : 0) / rate / 60.0;
+    return {static_cast<uint32_t>(std::clamp(rate + 0.5, 1.0, 999999.0)),
+            1 + static_cast<uint32_t>(std::clamp(minutes + 0.5, 0.0, 99999.0))};
 }
 // Where the bar should stand, 0 to 1.
 inline double Target(int64_t now) {
@@ -123,11 +196,25 @@ inline double Target(int64_t now) {
     if (at == 3) {
         const uint32_t of = total.load(std::memory_order_relaxed);
         part = of ? std::min(1.0, static_cast<double>(built.load(std::memory_order_relaxed)) / of) : part * 0.1;
+        // Core 0833: with the before-play pass, the boot pipelines fill the step's first tenth and
+        // each part of the pass its own share after them (the bar never moves back).
+        if (prepass.load(std::memory_order_relaxed)) {
+            static constexpr double kPartFrom[] = {0.0, 0.10, 0.15, 0.20, 0.35, 0.40, 1.00};
+            static constexpr double kPartTo[] = {0.10, 0.15, 0.20, 0.35, 0.40, 1.00, 1.00};
+            const uint32_t now_at = std::min<uint32_t>(Loading::part.load(std::memory_order_relaxed), 6);
+            const uint32_t done = part_done.load(std::memory_order_relaxed);
+            const uint32_t part_of = part_total.load(std::memory_order_relaxed);
+            const double fraction = now_at == 0 ? part
+                                    : part_of ? std::min(1.0, static_cast<double>(done) / part_of) : 0.0;
+            part = kPartFrom[now_at] + (kPartTo[now_at] - kPartFrom[now_at]) * fraction;
+        }
     }
     return kFrom[at] + (kTo[at] - kFrom[at]) * part;
 }
 // What the shader is given (the overlay's 24 words): the step, the progress in thousandths,
-// the shaders built and their total, the seconds the step has lasted. The bar moves towards
+// the shaders built and their total, the seconds the step has lasted, and while the shader set
+// is prepared before play: records a second, minutes left plus one, 1. Words 8-13 (core 0833):
+// the part of the before-play pass shown, its done and total, rate, minutes plus one, percent. The bar moves towards
 // its target a little with every picture and never back within one start.
 inline std::array<uint32_t, 24> State() {
     static double shown = 0;
@@ -146,6 +233,26 @@ inline std::array<uint32_t, 24> State() {
     state[2] = built.load(std::memory_order_relaxed);
     state[3] = total.load(std::memory_order_relaxed);
     state[4] = static_cast<uint32_t>(std::clamp<int64_t>((now - since.load(std::memory_order_relaxed)) / 1000, 0, 99999));
+    const auto pace = PreparePace(now);
+    state[5] = pace[0];
+    state[6] = pace[1];
+    state[7] = preparing.load(std::memory_order_relaxed);
+    // Core 0833: the part named on the screen (0: none, the screen as before), its done and total,
+    // units a second, minutes to go plus one, and its percentage.
+    if (const uint32_t shown = ShownPart(now); shown == static_cast<uint32_t>(Part::cache)) {
+        // T175d: the caches' write has no count; word 9 is its seconds so far (word 10 stays 0).
+        state[8] = shown;
+        state[9] = static_cast<uint32_t>(
+            std::clamp<int64_t>((now - part_since.load(std::memory_order_relaxed)) / 1000, 0, 99999));
+    } else if (shown != 0) {
+        const auto part_pace = PartPace(now);
+        state[8] = shown;
+        state[9] = part_done.load(std::memory_order_relaxed);
+        state[10] = part_total.load(std::memory_order_relaxed);
+        state[11] = part_pace[0];
+        state[12] = part_pace[1];
+        state[13] = part_pace[2];
+    }
     return state;
 }
 } // namespace Loading

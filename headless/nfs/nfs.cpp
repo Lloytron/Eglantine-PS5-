@@ -1642,10 +1642,17 @@ extern "C" void nfs_alias_commit(void)
 
 // ---- the C library's calls
 
+// T175d (headless/main.cpp, EDEN_UP_DRIVER_CACHE_SKIP_SAME / EDEN_UP_BOOT_CACHE_TEXT): told of every
+// fopen for writing; true refuses it (errno set). Weak: a program without it opens as before.
+extern "C" bool eden_fopen_write_veto(const char *path, const char *mode) __attribute__((weak));
+
 extern "C"
 {
     FILE *__wrap_fopen(const char *path, const char *mode)
     {
+        if (eden_fopen_write_veto && path && mode && (mode[0] == 'w' || mode[0] == 'a') &&
+            eden_fopen_write_veto(path, mode))
+            return nullptr;
         std::string nfs_path;
         if (!redirect(path, nfs_path))
             return __real_fopen(path, mode);

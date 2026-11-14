@@ -24,7 +24,14 @@ OUTPUT = ROOT / "headless/loading_text.glsl"
 
 # The lines the screen shows, in the order the shader names them (loading_scene.glsl).
 LINES = ["EGLANTINEPS5", "READING THE GAME", "STARTING GRAPHICS", "BUILDING SHADERS", "STARTING THE GAME",
-         "LOADING", "S"]
+         "LOADING", "S",
+         # core patch 0833: the before-play pass's parts, then "MB" and "MIN TO GO". Words were
+         # picked from the letters above, so the glyph table (and its indexes) stays as it was.
+         "READING GAME SHADERS", "CREATING THE SHADER LIST", "STORING THE SHADER LIST",
+         "SORTING THE SHADER LIST", "PREPARING SHADERS", "MB", "MIN TO GO",
+         # T175d (EDEN_UP_BOOT_CACHE_TEXT=1): the driver's caches written before the game starts.
+         # Letters from the lines above: the glyph table stays as it was.
+         "STORING THE SHADER CACHE"]
 # Only the glyphs the lines use, then the digits and signs of the figures.
 GLYPHS = "".join(sorted(set("".join(LINES)) - {" "})) + "0123456789%/"
 WIDTH, HEIGHT = 24, 20    # texels of one glyph's field

@@ -9,11 +9,29 @@
 namespace {
 struct DamagedCache {};
 
-// An entry's environment begins with five sizes; none can exceed what is left of the file.
+// EDEN_UP_CACHE_KEEP_GOOD=1 (exact "1"; T156b 0747, after zortos293/Lichii #815, Zortos): out of
+// memory while reading only stops the reading and the file stays whole (here it was cut back to
+// the entry being read, so the entries after it were lost although nothing was damaged); the
+// sixth size of an environment is checked too, and a compute entry must hold one environment
+// and a graphics entry no compute one. Read once. Off: this reader as before.
+bool KeepGoodEntries() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_UP_CACHE_KEEP_GOOD");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+// An entry's environment begins with five sizes (six with EDEN_UP_CACHE_KEEP_GOOD=1: the sixth
+// is the count of constant buffer replacements); none can exceed what is left of the file.
 void CheckEnvironment(std::ifstream& file, std::streamoff end) {
     const std::streamoff start = file.tellg();
-    std::array<u64, 5> sizes{};
-    file.read(reinterpret_cast<char*>(sizes.data()), sizeof(sizes));
+    std::array<u64, 6> sizes{};
+    file.read(reinterpret_cast<char*>(sizes.data()),
+              KeepGoodEntries() ? sizeof(sizes) : 5 * sizeof(u64));
+    if (!KeepGoodEntries()) {
+        sizes[5] = 0;
+    }
     const u64 left = static_cast<u64>(end - start);
     for (const u64 size : sizes) {
         if (size > left) throw DamagedCache{};
@@ -76,6 +94,16 @@ void LoadPipelines(
                 // vulkan_mesh.bin: task and mesh programs carry their mesh state (patch 0071).
                 env.Deserialize(file, with_mesh_state);
             }
+            if (KeepGoodEntries()) {
+                // 0747: a compute entry holds one environment, a graphics entry no compute one.
+                const auto is_compute = [](const FileEnvironment& env) {
+                    return env.ShaderStage() == Shader::Stage::Compute;
+                };
+                if (is_compute(envs.front()) ? num_envs != 1
+                                             : std::ranges::any_of(envs, is_compute)) {
+                    throw DamagedCache{};
+                }
+            }
             if (envs.front().ShaderStage() == Shader::Stage::Compute) {
                 load_compute(file, std::move(envs.front()));
             } else {
@@ -87,6 +115,15 @@ void LoadPipelines(
     } catch (const std::ios_base::failure&) {
     } catch (const DamagedCache&) {
     } catch (const std::bad_alloc&) {
+        if (KeepGoodEntries()) {
+            // 0747: memory is short, but the file is fine: it stays as it is.
+            std::fprintf(stderr,
+                         "[EglantinePS5] shader cache: no memory while reading %s after %lld "
+                         "bytes; reading stopped, the file is kept whole (EDEN_UP_CACHE_KEEP_GOOD)\n",
+                         Common::FS::PathToUTF8String(filename).c_str(),
+                         static_cast<long long>(good < 0 ? 0 : good));
+            return;
+        }
     } catch (const std::length_error&) {
     }
     std::error_code error;

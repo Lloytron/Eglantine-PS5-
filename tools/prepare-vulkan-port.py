@@ -284,6 +284,27 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {'''),
     ('    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};\n    if (!pipeline) {\n        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");\n        return;\n    }',
      '    ComputePipeline* const pipeline{pipeline_cache.CurrentComputePipeline()};\n    if (!pipeline) {\n        if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute pipeline unavailable");\n        return;\n    }\n'
      '    SCOPE_EXIT { SyncProbe(scheduler, "dispatch", pipeline); };'),
+    # EDEN_UP_GPU_PASS_TIME=1 (gpu_pass_probe.h): draws and clears per render target, and the
+    # game's compute as its own kind of work. Off: one bool test each.
+    ('#include "video_core/renderer_vulkan/vk_rasterizer.h"',
+     '#include "video_core/renderer_vulkan/vk_rasterizer.h"\n#include "gpu_pass_probe.h"'),
+    # Counted after the draw is recorded (Draw and DrawIndirect both go through PrepareDraw), so
+    # that a draw that begins a new pass counts for that pass, not the one before it (checker).
+    ('        Profile::Scope scope{Profile::Zone::DrawRecord};\n        draw_func();\n',
+     '        Profile::Scope scope{Profile::Zone::DrawRecord};\n        draw_func();\n'
+     '        ::Eden::GpuPass::CountDraw();\n'),
+    ('    blit_image.BlitColor(framebuffer, texture.RenderTarget(), texture.ImageHandle(),\n'
+     '                         sampler->Handle(), dst_region, src_region, src_size);\n}\n',
+     '    blit_image.BlitColor(framebuffer, texture.RenderTarget(), texture.ImageHandle(),\n'
+     '                         sampler->Handle(), dst_region, src_region, src_size);\n'
+     '    ::Eden::GpuPass::CountDraw();\n}\n'),
+    # A clear counts when Clear returns (after its pass was requested); a deferred one counts for
+    # the pass that realizes it as a load op (gpu_pass_probe.h ClearCount).
+    ('    if (!can_defer_clear) {\n        scheduler.RequestRenderpass(framebuffer);\n    }\n',
+     '    if (!can_defer_clear) {\n        scheduler.RequestRenderpass(framebuffer);\n    }\n'
+     '    const ::Eden::GpuPass::ClearCount gpu_pass_clear{can_defer_clear};\n'),
+    ('void RasterizerVulkan::DispatchCompute() {',
+     'void RasterizerVulkan::DispatchCompute() {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Compute};'),
 ])
 # Host conditional rendering (VK_EXT_conditional_rendering, dev_vulkan.h hcr_mode): count each
 # decision (EDEN_DEV_GUEST cond= slots 13-19); hcr=exact sends the conditions Eden would draw
@@ -1006,6 +1027,48 @@ adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
 # Development GPU fault probe (dev_vulkan.h, submit_sync=on): wait for every
 # submission, so the CPU never records against work the GPU has not finished.
 GPU_TIME_HELPERS = (port / 'gpu_time_probe.inc').read_text()
+# EDEN_UP_GPU_PASS_TIME=1 (gpu_pass_probe.h, the second half of gpu_time_probe.inc): the label of
+# a render pass, its largest attachment, read on the recording thread when the pass begins.
+GPU_PASS_HELPERS = """
+namespace {
+const char* GpuPassFormatName(VideoCore::Surface::PixelFormat format) {
+    using VideoCore::Surface::PixelFormat;
+    switch (format) {
+#define PIXEL_FORMAT_ELEM(NAME, ...) case PixelFormat::NAME: return #NAME;
+    PIXEL_FORMAT_LIST
+#undef PIXEL_FORMAT_ELEM
+    default:
+        return "invalid";
+    }
+}
+GpuPassLabel GpuPassLabelOf(const Framebuffer* framebuffer) {
+    if (!::Eden::GpuPass::on) return {};
+    using VideoCore::Surface::PixelFormat;
+    const RenderPassKey& key = framebuffer->RenderPassKeyBase();
+    const VkExtent2D area = framebuffer->RenderArea();
+    const u64 samples = key.samples > 0 ? static_cast<u64>(key.samples) : 1;
+    u64 best = 0;
+    PixelFormat best_format = PixelFormat::Invalid;
+    bool depth = false;
+    const auto consider = [&](PixelFormat format, bool is_depth) {
+        if (format == PixelFormat::Invalid || format >= PixelFormat::MaxDepthStencilFormat) return;
+        const u64 bytes = u64{area.width} * area.height * samples * VideoCore::Surface::BytesPerBlock(format);
+        if (bytes > best) {
+            best = bytes;
+            best_format = format;
+            depth = is_depth;
+        }
+    };
+    for (const PixelFormat format : key.color_formats) consider(format, false);
+    consider(key.depth_format, true);
+    if (best < (u64{64} << 20)) return {0, best, "small"};
+    return {(u64{area.width & 0xFFFF} << 48) | (u64{area.height & 0xFFFF} << 32) |
+                (u64{static_cast<u32>(best_format) & 0xFFFF} << 16) | ((samples & 0xFF) << 8) |
+                (depth ? 1 : 0) | 2,
+            best, GpuPassFormatName(best_format)};
+}
+} // namespace
+"""
 # EDEN_NX2_END_FAIL_SOFT=1: a command buffer the driver cannot end is dropped instead of ending
 # the session. Run 102 (Mario Kart, T27): vkEndCommandBuffer answered VK_ERROR_OUT_OF_DEVICE_MEMORY
 # at the course load, the exception left the worker thread, and the app stopped itself; run 101
@@ -1065,8 +1128,32 @@ adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp',
     ('        work_queue.pop();\n        event_cv.notify_all();',
      '        work_queue.pop();\n        if (!eden_vulkan_handoff_enabled() || (work_queue.empty() && drain_waiters)) drain_cv.notify_all();'),
 
-    ('#include <memory>', '#include <memory>\n#include <array>\n#include <chrono>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "submission_origin.h"\nextern "C" bool eden_vulkan_handoff_enabled();'),
-    ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS + END_FAIL_SOFT_HELPERS),
+    ('#include <memory>', '#include <memory>\n#include <array>\n#include <chrono>\n#include <cstdio>\n#include <vector>\n#include "dev_vulkan.h"\n#include "gpu_pass_probe.h"\n#include "submission_origin.h"\n#include "video_core/surface.h"\nextern "C" bool eden_vulkan_handoff_enabled();'),
+    ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS + GPU_PASS_HELPERS + END_FAIL_SOFT_HELPERS),
+    # EDEN_UP_GPU_PASS_TIME=1: on with the GPU time probe it needs, before the first command buffer.
+    ('        ::Eden::DevVulkan::gpu_time = true;\n    }\n',
+     '        ::Eden::DevVulkan::gpu_time = true;\n    }\n'
+     '    if (const char* const value = std::getenv("EDEN_UP_GPU_PASS_TIME"); value != nullptr && value[0] == \'1\') {\n'
+     '        ::Eden::DevVulkan::gpu_time = true;\n'
+     '        ::Eden::GpuPass::on = true;\n'
+     '        ::Eden::GpuPass::mark = &GpuPassMark;\n'
+     '    }\n'),
+    # Its stamps at the scheduler's render pass begin (outside the pass, before the barrier and
+    # the begin) and end (after the end and its barriers). Off: one bool test per pass.
+    ('    const bool after_compute = std::exchange(compute_writes_pending, false);\n'
+     '    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,\n'
+     '            after_compute](vk::CommandBuffer cmdbuf) {\n',
+     '    const bool after_compute = std::exchange(compute_writes_pending, false);\n'
+     '    const GpuPassLabel pass_label = GpuPassLabelOf(framebuffer);\n'
+     '    Record([renderpass, framebuffer_handle, render_area, values, clear_value_count,\n'
+     '            after_compute, pass_label, pass_counts = ::Eden::GpuPass::TakeCounts(),\n'
+     '            pass_load_clears = ::Eden::GpuPass::TakeLoadClears()](vk::CommandBuffer cmdbuf) {\n'
+     '        GpuPassBegin(*cmdbuf, pass_label, pass_counts, pass_load_clears);\n'),
+    ('        Record([num_images = num_renderpass_images,\n',
+     '        Record([pass_counts = ::Eden::GpuPass::TakeCounts(), num_images = num_renderpass_images,\n'),
+    ('                                       0, XFB_OUTPUT_BARRIER);\n            }\n        });\n',
+     '                                       0, XFB_OUTPUT_BARRIER);\n            }\n'
+     '            GpuPassEnd(*cmdbuf, pass_counts);\n        });\n'),
     ('        .pInheritanceInfo = nullptr,\n    });\n}\n\nu64 Scheduler::SubmitExecution(',
      '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_upload_cmdbuf);\n}\n\nu64 Scheduler::SubmitExecution('),
     ('u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {',
@@ -1080,6 +1167,7 @@ adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp',
      '                            submit_origin = gpu_submit_origin,'),
     # EDEN_NX2_END_FAIL_SOFT (END_FAIL_SOFT_HELPERS): both ends go through the helper.
     ('        upload_cmdbuf.End();\n        cmdbuf.End();\n\n        if (on_submit)',
+     '        GpuPassUploadEnd(upload_cmdbuf);\n'
      '        GpuTimeEnd(cmdbuf);\n'
      '        EndCommandBuffersOrDrop(upload_cmdbuf, cmdbuf, *command_pool, device, signal_value);\n\n'
      '        if (on_submit)'),
@@ -1115,7 +1203,11 @@ adapt('src/video_core/renderer_vulkan/renderer_vulkan.h',
 adapt('src/video_core/renderer_vulkan/renderer_vulkan.cpp', 'vulkan_renderer.cpp', [
     ('#include "video_core/renderer_vulkan/renderer_vulkan.h"',
      '#include "video_core/renderer_vulkan/renderer_vulkan.h"\n#include "display_refresh.h"\n'
-     '#include "diagnostics.h"\n#include "hud.h"'),
+     '#include "diagnostics.h"\n#include "hud.h"\n#include "gpu_pass_probe.h"'),
+    # EDEN_UP_GPU_PASS_TIME=1: the frames its per-frame figures divide by (one per Composite).
+    ('void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {',
+     'void RendererVulkan::Composite(std::span<const Tegra::FramebufferConfig> framebuffers) {\n'
+     '    ::Eden::GpuPass::CountPresent();'),
     # The HUD counted the guest rate only: OnFrameDisplayed() runs once per Composite(), while the
     # frames frame generation adds are presented through PresentManager::Present() (hud.h). Count
     # every frame handed to the present manager.
@@ -1659,7 +1751,15 @@ probes = {
          '    entries.emplace(key, std::move(entry));'),
     ],
     'vk_buffer_cache': [
-        ('#include <algorithm>', '#include <algorithm>\n#include "dev_vulkan.h"\n#include "submission_origin.h"'),
+        ('#include <algorithm>', '#include <algorithm>\n#include "dev_vulkan.h"\n#include "gpu_pass_probe.h"\n#include "submission_origin.h"'),
+        # EDEN_UP_GPU_PASS_TIME=1 (gpu_pass_probe.h): buffer copies recorded in the main command
+        # buffer (downloads and uploads that go through a staging copy here too) count as copies.
+        # Only that path is tagged: a reordered upload goes into the upload buffer (its own
+        # bucket), and a batched one (RecordUpload) would be flushed at once by the tag's own
+        # Record, which would undo the batching while the probe runs (checker).
+        ('    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier,\n',
+         '    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Copy};\n'
+         '    scheduler.Record([src_buffer, dst_buffer, vk_copies, barrier,\n'),
         ('void BufferCacheRuntime::Finish() {',
          'void BufferCacheRuntime::Finish() {\n'
          '    ::Eden::VulkanProbe::GpuSubmitOriginScope origin{__builtin_return_address(0), true};'),
@@ -1670,6 +1770,30 @@ probes = {
     # With custom border colours off (the console default), report which clamp-to-border
     # samplers ask for a colour the three standard ones cannot give exactly.
     'vk_texture_cache': [
+    # EDEN_UP_GPU_PASS_TIME=1 (gpu_pass_probe.h): the texture cache's work outside render passes,
+    # tagged by kind (two recorded marks per call while on; one bool test while off).
+    ('#include "video_core/renderer_vulkan/vk_texture_cache.h"',
+     '#include "video_core/renderer_vulkan/vk_texture_cache.h"\n#include "gpu_pass_probe.h"'),
+    ('void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,\n                                           std::span<const VideoCommon::ImageCopy> copies) {\n',
+     'void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,\n                                           std::span<const VideoCommon::ImageCopy> copies) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Copy};\n'),
+    ('void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,\n                                    const Region2D& dst_region, const Region2D& src_region,\n                                    Tegra::Engines::Fermi2D::Filter filter,\n                                    Tegra::Engines::Fermi2D::Operation operation) {\n',
+     'void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,\n                                    const Region2D& dst_region, const Region2D& src_region,\n                                    Tegra::Engines::Fermi2D::Filter filter,\n                                    Tegra::Engines::Fermi2D::Operation operation) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Copy};\n'),
+    ('void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view) {\n',
+     'void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Copy};\n'),
+    ('void TextureCacheRuntime::CopyImage(Image& dst, Image& src,\n                                    std::span<const VideoCommon::ImageCopy> copies) {\n',
+     'void TextureCacheRuntime::CopyImage(Image& dst, Image& src,\n                                    std::span<const VideoCommon::ImageCopy> copies) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Copy};\n'),
+    ('void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,\n                                        std::span<const VideoCommon::ImageCopy> copies) {\n',
+     'void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,\n                                        std::span<const VideoCommon::ImageCopy> copies) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Copy};\n'),
+    ('void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,\n                         std::span<const VideoCommon::BufferImageCopy> copies) {\n',
+     'void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,\n                         std::span<const VideoCommon::BufferImageCopy> copies) {\n    ::Eden::GpuPass::Scope pass_tag{*scheduler, ::Eden::GpuPass::UploadImage};\n'),
+    ('void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,\n                            std::span<const VideoCommon::BufferImageCopy> copies) {\n',
+     'void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> offsets_span,\n                            std::span<const VideoCommon::BufferImageCopy> copies) {\n    ::Eden::GpuPass::Scope pass_tag{*scheduler, ::Eden::GpuPass::Download};\n'),
+    ('void TextureCacheRuntime::AccelerateImageUpload(\n    Image& image, const StagingBufferRef& map,\n    std::span<const VideoCommon::SwizzleParameters> swizzles,\n    u32 z_start, u32 z_count) {\n',
+     'void TextureCacheRuntime::AccelerateImageUpload(\n    Image& image, const StagingBufferRef& map,\n    std::span<const VideoCommon::SwizzleParameters> swizzles,\n    u32 z_start, u32 z_count) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Astc};\n'),
+    ('void TextureCacheRuntime::AccelerateImageUploadLayers(\n    Image& image, const StagingBufferRef& map,\n    std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {\n',
+     'void TextureCacheRuntime::AccelerateImageUploadLayers(\n    Image& image, const StagingBufferRef& map,\n    std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Astc};\n'),
+    ('void TextureCacheRuntime::TranscodeAstcBatched(\n    Image& image, const StagingBufferRef& map,\n    std::span<const VideoCommon::SwizzleParameters> swizzles, const AstcBatchPlan& plan) {\n',
+     'void TextureCacheRuntime::TranscodeAstcBatched(\n    Image& image, const StagingBufferRef& map,\n    std::span<const VideoCommon::SwizzleParameters> swizzles, const AstcBatchPlan& plan) {\n    ::Eden::GpuPass::Scope pass_tag{scheduler, ::Eden::GpuPass::Astc};\n'),
         ('void TextureCacheRuntime::Finish() {',
          'void TextureCacheRuntime::Finish() {\n'
          '    ::Eden::VulkanProbe::GpuSubmitOriginScope origin{__builtin_return_address(0), true};'),

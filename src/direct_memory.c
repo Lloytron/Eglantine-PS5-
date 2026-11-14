@@ -39,12 +39,150 @@ static atomic_ullong eden_band_hits, eden_band_fallbacks;
 static unsigned eden_direct_class(size_t size) {
   return size < EDEN_DIRECT_SMALL ? 0 : size == EDEN_DIRECT_SMALL ? 1 : size <= ((size_t)32 << 20) ? 2 : 3;
 }
+/* EDEN_POOL_LEDGER_EXACT=1 (exact "1"; off by default): the counters above are taken off by the
+ * size each release names, but a block is often given back in pieces of another size class. The
+ * guest's 2 MiB slots (taken in class "2 MiB") go back as two halves (the in-place check), as a
+ * tail after packing in place, or as a packed block whose kept size changed since it was taken;
+ * every such piece is taken off "under 2 MiB", which wraps below zero (waveydude's four 13.60
+ * runs, 12 Nov: "17592186038714 MiB in 18446744073709546170 blocks"; 5,446 blocks too many).
+ * With the switch every block taken is noted (start, end, the block it came from, its class) and
+ * a release takes its bytes off the class of the block they came from; the block count drops when
+ * the last piece of that block is back. A release (or the part of it) that matches no noted block
+ * is taken off by the old rule and counted as "unmatched". Off: one relaxed load of a cached answer per take and per release. */
+#define EDEN_LEDGER_MAX 8192 /* 256 KiB of zeroes in .bss, written only with the switch */
+struct eden_ledger_piece {
+  int64_t start, end; /* what is still out of this piece of a block */
+  int64_t block;      /* where the block it came from began; its class in the low 2 bits */
+  int64_t block_end;  /* where that block ended: its pieces all lie in [block, block_end) */
+};
+static struct eden_ledger_piece eden_ledger_pieces[EDEN_LEDGER_MAX]; /* by start */
+static unsigned eden_ledger_count;
+static atomic_flag eden_ledger_lock = ATOMIC_FLAG_INIT;
+static atomic_int eden_ledger_state;         /* 0 not decided yet (off), 1 on, 2 off */
+static atomic_ullong eden_ledger_unmatched;  /* releases (or parts) that matched no noted block */
+static atomic_ullong eden_ledger_unmatched_bytes;
+static atomic_ullong eden_ledger_untracked;  /* blocks or pieces not noted: the table was full */
+
+/* The switch is decided by main right after env.txt is applied (eden_direct_ledger_exact_init):
+ * the heap's first blocks and the launcher's thread stacks are taken before that, and a getenv
+ * here would have read the switch too early and kept it off for the whole run. Until then: off,
+ * nothing cached. Blocks taken before it is on are not noted; their releases count "unmatched". */
+static int eden_ledger_exact(void) {
+  return atomic_load_explicit(&eden_ledger_state, memory_order_relaxed) == 1;
+}
+void eden_direct_ledger_exact_init(void) {
+  const char *value = getenv("EDEN_POOL_LEDGER_EXACT");
+  atomic_store_explicit(&eden_ledger_state, value && value[0] == '1' && value[1] == '\0' ? 1 : 2,
+                        memory_order_relaxed);
+}
+static void eden_ledger_acquire(void) {
+  while (atomic_flag_test_and_set_explicit(&eden_ledger_lock, memory_order_acquire)) {}
+}
+static void eden_ledger_release(void) { atomic_flag_clear_explicit(&eden_ledger_lock, memory_order_release); }
+/* Under eden_ledger_lock: the first piece whose end is past `at`. */
+static unsigned eden_ledger_find(int64_t at) {
+  unsigned low = 0, high = eden_ledger_count;
+  while (low < high) {
+    const unsigned mid = low + (high - low) / 2;
+    if (eden_ledger_pieces[mid].end <= at) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
+/* Under eden_ledger_lock. 0: the table is full. */
+static int eden_ledger_insert(int64_t start, int64_t end, int64_t block, int64_t block_end) {
+  if (eden_ledger_count == EDEN_LEDGER_MAX) {
+    atomic_fetch_add_explicit(&eden_ledger_untracked, 1, memory_order_relaxed);
+    return 0;
+  }
+  const unsigned at = eden_ledger_find(start);
+  for (unsigned i = eden_ledger_count; i > at; --i) eden_ledger_pieces[i] = eden_ledger_pieces[i - 1];
+  eden_ledger_pieces[at] = (struct eden_ledger_piece){start, end, block, block_end};
+  ++eden_ledger_count;
+  return 1;
+}
+/* Under eden_ledger_lock (taken around the system call, so that a range given back cannot be
+ * given out again and noted before its release is noted). */
+static void eden_ledger_note_take(int64_t start, size_t size) {
+  (void)eden_ledger_insert(start, start + (int64_t)size, start | (int64_t)eden_direct_class(size),
+                           start + (int64_t)size);
+}
+/* Under eden_ledger_lock, like the take: the release off the class of the block each part of it
+ * came from. */
+static void eden_ledger_note_release(int64_t start, size_t size) {
+  const int64_t end = start + (int64_t)size;
+  uint64_t matched = 0;
+  unsigned i = eden_ledger_find(start);
+  while (i < eden_ledger_count && eden_ledger_pieces[i].start < end) {
+    struct eden_ledger_piece piece = eden_ledger_pieces[i];
+    const int64_t low = piece.start > start ? piece.start : start;
+    const int64_t high = piece.end < end ? piece.end : end;
+    const unsigned cls = (unsigned)(piece.block & 3);
+    const int64_t block = piece.block & ~(int64_t)3;
+    matched += (uint64_t)(high - low);
+    atomic_fetch_sub_explicit(&eden_direct_bytes[cls], (unsigned long long)(high - low), memory_order_relaxed);
+    if (low > piece.start && high < piece.end) {
+      /* A hole in the middle: the piece becomes two. */
+      eden_ledger_pieces[i].end = low;
+      (void)eden_ledger_insert(high, piece.end, piece.block, piece.block_end);
+      break;
+    }
+    if (low > piece.start) {
+      eden_ledger_pieces[i].end = low;
+      ++i;
+      continue;
+    }
+    if (high < piece.end) {
+      eden_ledger_pieces[i].start = high;
+      break;
+    }
+    /* The whole piece is back: out of the table, and the block's count too if it was its last. */
+    for (unsigned j = i + 1; j < eden_ledger_count; ++j) eden_ledger_pieces[j - 1] = eden_ledger_pieces[j];
+    --eden_ledger_count;
+    int last = 1;
+    for (unsigned j = eden_ledger_find(block); j < eden_ledger_count && eden_ledger_pieces[j].start < piece.block_end; ++j) {
+      if (eden_ledger_pieces[j].block == piece.block) {
+        last = 0;
+        break;
+      }
+    }
+    if (last) atomic_fetch_sub_explicit(&eden_direct_blocks[cls], 1, memory_order_relaxed);
+  }
+  if (matched < (uint64_t)size) {
+    /* Not noted: taken before main turned the switch on (the launcher's stacks, the heap's first
+     * blocks) or while the table was full. Those were counted by the old rule, so the rest is
+     * taken off by the old rule too (and a block, when nothing at all matched). */
+    const unsigned cls = eden_direct_class(size);
+    atomic_fetch_sub_explicit(&eden_direct_bytes[cls], (unsigned long long)((uint64_t)size - matched),
+                              memory_order_relaxed);
+    if (matched == 0) atomic_fetch_sub_explicit(&eden_direct_blocks[cls], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_ledger_unmatched, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_ledger_unmatched_bytes, (uint64_t)size - matched, memory_order_relaxed);
+  }
+}
+/* 0: EDEN_POOL_LEDGER_EXACT is off (nothing written). headless/performance.cpp prints it. */
+int eden_direct_ledger_exact(unsigned long long *pieces, unsigned long long *unmatched,
+                             unsigned long long *unmatched_bytes, unsigned long long *untracked) {
+  if (!eden_ledger_exact()) return 0;
+  eden_ledger_acquire();
+  *pieces = eden_ledger_count;
+  eden_ledger_release();
+  *unmatched = atomic_load_explicit(&eden_ledger_unmatched, memory_order_relaxed);
+  *unmatched_bytes = atomic_load_explicit(&eden_ledger_unmatched_bytes, memory_order_relaxed);
+  *untracked = atomic_load_explicit(&eden_ledger_untracked, memory_order_relaxed);
+  return 1;
+}
+
 static int eden_direct_take(int64_t from, int64_t to, size_t size, size_t alignment, int type, int64_t *start) {
+  const int exact = eden_ledger_exact();
+  if (exact) eden_ledger_acquire();
   const int result = __real_sceKernelAllocateDirectMemory(from, to, size, alignment, type, start);
   if (result == 0) {
     atomic_fetch_add_explicit(&eden_direct_bytes[eden_direct_class(size)], size, memory_order_relaxed);
     atomic_fetch_add_explicit(&eden_direct_blocks[eden_direct_class(size)], 1, memory_order_relaxed);
+    if (exact) eden_ledger_note_take(*start, size);
   }
+  if (exact) eden_ledger_release();
   return result;
 }
 void eden_direct_ledger(unsigned long long *bytes, unsigned long long *blocks,
@@ -178,10 +316,19 @@ int __wrap_sceKernelAllocateDirectMemory(int64_t from, int64_t to, size_t size, 
 }
 
 int __wrap_sceKernelReleaseDirectMemory(int64_t start, size_t size) {
-  const int result = __real_sceKernelReleaseDirectMemory(start, size);
-  if (result != 0) return result;
-  atomic_fetch_sub_explicit(&eden_direct_bytes[eden_direct_class(size)], size, memory_order_relaxed);
-  atomic_fetch_sub_explicit(&eden_direct_blocks[eden_direct_class(size)], 1, memory_order_relaxed);
+  int result;
+  if (eden_ledger_exact()) {
+    eden_ledger_acquire();
+    result = __real_sceKernelReleaseDirectMemory(start, size);
+    if (result == 0) eden_ledger_note_release(start, size);
+    eden_ledger_release();
+    if (result != 0) return result;
+  } else {
+    result = __real_sceKernelReleaseDirectMemory(start, size);
+    if (result != 0) return result;
+    atomic_fetch_sub_explicit(&eden_direct_bytes[eden_direct_class(size)], size, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_direct_blocks[eden_direct_class(size)], 1, memory_order_relaxed);
+  }
   eden_direct_acquire();
   if (size == EDEN_DIRECT_SMALL && eden_direct_floor != 0 && start >= eden_direct_floor &&
       eden_direct_hole_count < sizeof(eden_direct_holes) / sizeof(eden_direct_holes[0]))

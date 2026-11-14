@@ -345,6 +345,81 @@ struct eden_heap_thread {
 static struct eden_heap_thread eden_heap_threads[EDEN_HEAP_THREADS];
 static atomic_uchar eden_heap_thread_used[EDEN_HEAP_THREADS];
 
+/* EDEN_UP_BUILD_BURST_LOG (core patch 0592): a sidecar, so eden_heap_thread's size and offsets
+ * stay unchanged. It counts operations on the executing thread, NOT ownership of blocks freed on
+ * another thread, and only while that thread is inside a build scope (depth > 0): a thread outside
+ * one pays one more load. One cache line per record (512 x 64 = 32 KiB), so neighbouring threads'
+ * records never share a line. Only the record's own thread writes it (every eden_heap_charge caller
+ * passes eden_heap_self()), hence a relaxed load and store instead of a locked add; the reporter
+ * reads with relaxed loads, a snapshot is approximate, not transactional. */
+struct eden_build_heap_record {
+  _Alignas(64) atomic_llong net;
+  atomic_llong peak;
+  atomic_ullong allocated;
+  atomic_llong base;
+  atomic_ullong allocated_base;
+  unsigned depth;
+};
+_Static_assert(sizeof(struct eden_build_heap_record) == 64, "one cache line per build heap record");
+static struct eden_build_heap_record eden_build_heap_records[EDEN_HEAP_THREADS];
+static atomic_uint eden_build_heap_enabled;
+void eden_build_heap_enable(void) {
+  atomic_store_explicit(&eden_build_heap_enabled, 1, memory_order_release);
+}
+
+static void eden_build_heap_charge(struct eden_heap_thread *self, long bytes) {
+  if (!atomic_load_explicit(&eden_build_heap_enabled, memory_order_relaxed))
+    return;
+  struct eden_build_heap_record *r = &eden_build_heap_records[self - eden_heap_threads];
+  if (r->depth == 0)
+    return;
+  const long long net = atomic_load_explicit(&r->net, memory_order_relaxed) + bytes;
+  atomic_store_explicit(&r->net, net, memory_order_relaxed);
+  if (bytes > 0)
+    atomic_store_explicit(&r->allocated,
+                          atomic_load_explicit(&r->allocated, memory_order_relaxed) + (unsigned long long)bytes,
+                          memory_order_relaxed);
+  const long long delta = net - atomic_load_explicit(&r->base, memory_order_relaxed);
+  if (delta > atomic_load_explicit(&r->peak, memory_order_relaxed))
+    atomic_store_explicit(&r->peak, delta, memory_order_relaxed);
+}
+
+/* RADV_PS5_LONGLIVED_ARENA (T175b; our own, after heydemoura/EglantinePS5 PR 104, branch
+ * perf/heap-memory, commit 0a5efdc, docs/HEAP-MEMORY-RESEARCH.md "next steps" 1, which proposes it
+ * and does not write it). Read from main in eden_heap_pool_init (headless/heap_pages.cpp); unset: off,
+ * nothing below runs but one relaxed load on the paths named.
+ *   1  route: a small request made inside a long-lived scope (eden_heap_long_lived_enter/leave, which
+ *      the driver calls around the objects it keeps: lead-mesh-42) goes to one shared set of arenas
+ *      kept for such objects, not to the thread's own; no thread cache either way; and the counts below.
+ *   0  count only: no routing, but the scopes are tracked and the requests (and bytes) made inside
+ *      them counted (ll_requests, ll_bytes), with the boot-end lines and the 20 s line, so a run
+ *      without routing gives the same numbers to compare.
+ * Why: on a cold shader build the driver's eight compile threads churn tens of GB of compiler
+ * memory (ralloc) through their own arenas, and between those short-lived blocks they make the
+ * objects the driver keeps (radv_shader and its code copy and debug info, cache objects, pipelines,
+ * descriptor set layouts). One kept object holds a whole 2 MiB arena: heydemoura measured 231 arenas
+ * (462 MiB) holding 83 MiB after a cold build; ours, about 650 MiB of slack a trim cannot give back.
+ * With the kept objects elsewhere the compile arenas empty at the end of each build: their 2 MiB pages
+ * free whole ("pinned" falls). With EDEN_HEAP_KEEP_ARENAS unset they also leave their records at the
+ * next trim and become spares that any thread takes before the heap grows; with it set (play env)
+ * they stay their records' and only their own thread or an adopt reuses them.
+ * Review (T175b fix): a thread with no arena of its own never takes one of the set as its arena
+ * (eden_heap_thread_arena's round-robin); after a request the set could not serve, the thread's next
+ * EDEN_HEAP_ARENA_RETRY kept-object requests try only the set's current arena, without the creation
+ * lock (eden_heap_ll_retry, as eden_heap_arena_allocate's retry); no new arena is made for a request
+ * of EDEN_HEAP_ARENA_GROW_REQUEST or more (it takes room in the set's arenas or the usual path). */
+#define EDEN_HEAP_LL_ARENAS 128u /* 256 MiB of kept objects at most; past it the thread's arenas */
+static atomic_int eden_heap_ll_mode = -1;      /* -1 unset, 0 count only, 1 route */
+static atomic_int eden_heap_ll_on;             /* 1: route (mode 1) */
+static atomic_int eden_heap_ll_track;          /* 1: scopes tracked and counted (mode 0 or 1) */
+static void *_Atomic eden_heap_ll_arena[EDEN_HEAP_LL_ARENAS];
+static atomic_uint eden_heap_ll_count;   /* entries made (under the creation lock); never removed */
+static atomic_uint eden_heap_ll_current; /* the entry asked first */
+static atomic_uchar eden_heap_ll_slot[EDEN_HEAP_SLOTS]; /* 1: the slot's arena is one of the set */
+static unsigned eden_heap_ll_depth[EDEN_HEAP_THREADS];  /* per record: scopes its thread is inside */
+static unsigned eden_heap_ll_retry[EDEN_HEAP_THREADS];  /* per record: requests before the set is searched again */
+static atomic_ullong eden_heap_ll_requests, eden_heap_ll_fallbacks, eden_heap_ll_scopes, eden_heap_ll_bytes;
+
 static void eden_heap_apply(long bytes, long blocks) {
   if (blocks)
     atomic_fetch_add_explicit(&ps5_heap_blocks, (size_t)blocks, memory_order_relaxed);
@@ -397,8 +472,11 @@ void eden_heap_spill_stats(unsigned long long *spills, unsigned long long *spill
     *free_cycles = atomic_load_explicit(&eden_heap_shared_free_cycles, memory_order_relaxed);
 }
 
+static void eden_big_thread_ended(struct eden_heap_thread *self); /* EDEN_UP_BIG_STACKS */
+
 static void eden_heap_thread_exit(void *value) {
   struct eden_heap_thread *self = value;
+  eden_big_thread_ended(self);
   for (unsigned bin = 0; bin < EDEN_TCACHE_BINS; ++bin) {
     while (self->bins[bin] != NULL) {
       void *block = self->bins[bin];
@@ -894,6 +972,363 @@ static void eden_heap_note_growth(size_t bytes, unsigned pieces) {
     __atomic_fetch_add(&self->grown, pieces, __ATOMIC_RELAXED);
 }
 
+/* ---- EDEN_UP_HEAP_HOLD_AT_LOAD=<s> (t174a, our own; 1 to 600, digits only; unset, 0 or anything
+ * else: off; read from main in eden_heap_pool_init, headless/heap_pages.cpp) ----
+ * Why (13 Nov 2026, T166, the load into the area past the field): run1395's heap gave a 32 MiB piece
+ * back to the pool ("gave back 32 MiB: the pool is short", stderr 983) 2 s into the load, and 9 s
+ * later the image table's doubling needed 10,354,696 bytes with the pool at 15-27 MiB free in pieces
+ * of 2 MiB or less: EDEN_NEW_WAIT gave up after 2000 ms and the program ended (stderr 2010-2017). The
+ * heap grew 64-96 MiB at that load in every start of the batch (1248 -> 1344, 1280 -> 1344 MiB).
+ * What it does:
+ *  - A hold: from each call of eden_heap_hold_area (the texture cache, when AreaEvict's window opens
+ *    or is extended by a burst of new images: core patch 0893) or eden_heap_hold_begin (the driver
+ *    refused a request of 64 MiB or more: headless/performance.cpp, eden_radv_out_of_memory; an
+ *    area's big image comes before its burst of images: run1399, its crash log
+ *    975-1012: the driver refused 304,132 KiB, the trim gave it the heap's 32 MiB, and 1.6 s later a
+ *    4 MiB heap request waited 1800 ms and failed; the burst was at line 1605) until <s> seconds after
+ *    the last one,
+ *    eden_heap_trim gives no space back (empty arenas still go to the spares; nothing leaves the
+ *    heap). Held: TrimHeap ("the pool is short", "the driver found no memory") and the builders'
+ *    give-back; operator new's and the door's waits, the JIT's and the guest's waits are let
+ *    through (eden_heap_trim_unheld, see Bounds below).
+ *  - A spare: EDEN_UP_HEAP_HOLD_SPARE_MIB (32 or 64; unset: 32; 0: none) of pieces committed while the
+ *    pool has room (at main's start, and from the memory report every 2 s at most while the pool's
+ *    largest free block is 256 MiB or more and no hold runs), no space over them.
+ *    When the pool refuses a growth (in a hold or not), the spare becomes that space. Not counted in
+ *    the heap's "holds" figure while it is a spare (the census's heap= and the adopt slack gate are
+ *    as without it); its line says what it holds.
+ * Bounds (review, 13 Nov): a hold runs at most 3 x <s> s however often it is extended (the texture
+ * cache's window, driver refusals), and after one that ran that long none begins for <s> s. The hold
+ * stops only the give-backs to others: TrimHeap ("the pool is short", "the driver found no memory")
+ * and the builders' give-back (EDEN_UP_BUILD_GIVE_BACK). These trim through eden_heap_trim_unheld,
+ * which a hold does not stop: the guest's block wait (EDEN_UP_BLOCK_WAIT_TRIM,
+ * src/guest_memory_service.inc; a game write with no 2 MiB block is the old crash, and waveydude's
+ * W-05 died with 26 MiB of empty heap pages and the pool at 1 MiB), the JIT code cache's waits
+ * (headless/jit-allocator.h; it aborts when the wait finds nothing) and operator new's own waits
+ * (headless/main.cpp: give the empty spaces back, then grow one large enough; run1402's 9,529,344
+ * byte request was served that way after 480 ms and 2 trims, its crash log 1145-1146).
+ * Its price: the spare's 32-64 MiB are out of the pool for good while the switch is on, and during a
+ * hold an empty piece stays in the heap where graphics might have used it. Off: one relaxed load in
+ * eden_heap_trim and in a growth the pool refused, and eden_heap_hold_area returns at once.
+ * Counted: EDEN_UP_HEAP_HOLD line every 10 s while on (headless/performance.cpp). */
+static atomic_uint eden_heap_hold_seconds;           /* 0: off */
+static atomic_uint eden_heap_hold_spare_pieces_want; /* pieces the spare should hold */
+static atomic_ullong eden_heap_hold_until_us;        /* process time (us) the hold ends; 0: none yet */
+static atomic_ullong eden_heap_hold_since_us;        /* when the running hold began */
+static atomic_ullong eden_heap_hold_quiet_until_us;  /* no hold begins before this (after a capped one) */
+static atomic_ullong eden_heap_hold_capped, eden_heap_hold_unheld_trims;
+/* ---- T178b EDEN_UP_HEAP_HOLD_REFILL_MIB=<n> (32 to 4096, digits only; unset or anything else: off, the
+ * spare as T177 keeps it). Why: T175's F3 (13 Nov, with the stand) had its spare serve one refused growth
+ * and never get it back (the refill waited for 256 MiB in one block and no hold), and C3 died 2 s later
+ * on a plain 8,294,400-byte operator new nobody caught. With the switch:
+ *  - a refused growth takes only the pieces it needs from the spare; the rest stays a spare for the next
+ *    one (with the 32 MiB pieces this matters for a 64 MiB spare: two growths of up to 31 MiB each);
+ *  - the memory report (every 100 ms at most) tops the spare up to its size as soon as the pool's largest
+ *    free block is <n> MiB or more, during a hold too (a hold keeps the heap's empty spaces; it never
+ *    stopped the heap from growing), one try every 250 ms at most;
+ *  - the spare is up to EDEN_HEAP_HOLD_RUNS runs of pieces (a run is a range in address: a growth is one
+ *    space, so it is served by one run that is large enough).
+ * Its own line: EDEN_UP_HEAP_HOLD_REFILL every 10 s while its counts move (eden_heap_hold_refill, outside
+ * every lock). The EDEN_UP_HEAP_HOLD line keeps its fields: "spare ... MiB ready" is all runs together,
+ * "taken" counts each run committed, "served" each growth the spare made. */
+#define EDEN_HEAP_HOLD_RUNS 4u
+static atomic_ullong eden_heap_hold_refill_bytes;    /* 0: off */
+static atomic_ullong eden_heap_hold_refill_last_us;  /* the last try of the refill */
+static atomic_ullong eden_heap_hold_refills, eden_heap_hold_refills_in_hold, eden_heap_hold_refill_tries,
+    eden_heap_hold_served_partial, eden_heap_hold_refill_reported_us, eden_heap_hold_refill_reported_sum;
+/* The spare's runs [first, first + span), under the growth lock; span 0: an empty run. Off: run 0 only. */
+static unsigned eden_heap_hold_run_first[EDEN_HEAP_HOLD_RUNS], eden_heap_hold_run_span[EDEN_HEAP_HOLD_RUNS];
+static atomic_uint eden_heap_hold_spare_now; /* pieces in all runs, for the reports */
+/* Under the growth lock: the pieces the runs hold. */
+static unsigned eden_heap_hold_spare_total_locked(void) {
+  unsigned total = 0;
+  for (unsigned run = 0; run < EDEN_HEAP_HOLD_RUNS; ++run)
+    total += eden_heap_hold_run_span[run];
+  return total;
+}
+/* Under the growth lock: a run that can serve `pieces` (the smallest that can), or EDEN_HEAP_HOLD_RUNS. */
+static unsigned eden_heap_hold_run_for_locked(size_t pieces) {
+  unsigned best = EDEN_HEAP_HOLD_RUNS;
+  for (unsigned run = 0; run < EDEN_HEAP_HOLD_RUNS; ++run)
+    if (eden_heap_hold_run_span[run] != 0 && pieces <= eden_heap_hold_run_span[run] &&
+        (best == EDEN_HEAP_HOLD_RUNS || eden_heap_hold_run_span[run] < eden_heap_hold_run_span[best]))
+      best = run;
+  return best;
+}
+static atomic_ullong eden_heap_hold_last_fill_us;
+/* Counts: holds begun, trims that kept the spaces, spares taken (and their MiB), takes the pool
+ * refused, growths the spare served (and the bytes asked), of them inside a hold. */
+static atomic_ullong eden_heap_hold_begun, eden_heap_hold_begun_area, eden_heap_hold_trims_kept, eden_heap_hold_spare_taken,
+    eden_heap_hold_spare_taken_mib, eden_heap_hold_spare_refused, eden_heap_hold_served,
+    eden_heap_hold_served_bytes, eden_heap_hold_served_in_hold;
+
+static int eden_heap_hold_active(unsigned long long now_us) {
+  if (atomic_load_explicit(&eden_heap_hold_seconds, memory_order_relaxed) == 0)
+    return 0;
+  const unsigned long long until = atomic_load_explicit(&eden_heap_hold_until_us, memory_order_relaxed);
+  return until != 0 && now_us < until;
+}
+
+/* The spare, under the growth lock: pieces given back earlier in a row first, else the next ones,
+ * committed now. 1: there is a spare (now or already). */
+static int eden_heap_hold_fill_locked(void) {
+  /* T178b refill: the pieces missing, into an empty run; off: only when the spare is empty (as T177). */
+  const int refill = atomic_load_explicit(&eden_heap_hold_refill_bytes, memory_order_relaxed) != 0;
+  const unsigned held = eden_heap_hold_spare_total_locked();
+  const unsigned full = atomic_load_explicit(&eden_heap_hold_spare_pieces_want, memory_order_relaxed);
+  if (held != 0 && (!refill || held >= full))
+    return 1;
+  unsigned slot_run = EDEN_HEAP_HOLD_RUNS;
+  for (unsigned run = 0; run < (refill ? EDEN_HEAP_HOLD_RUNS : 1u); ++run)
+    if (eden_heap_hold_run_span[run] == 0) {
+      slot_run = run;
+      break;
+    }
+  if (slot_run == EDEN_HEAP_HOLD_RUNS)
+    return held != 0;
+  const unsigned want = full - held;
+  if (want == 0 || !eden_heap_grows)
+    return held != 0;
+  const unsigned used = atomic_load_explicit(&eden_heap_pieces_used, memory_order_relaxed);
+  unsigned first = used;
+  for (unsigned at = 0, run = 0; at < used; ++at) {
+    run = atomic_load_explicit(&eden_heap_piece_state[at], memory_order_relaxed) == 1 ? run + 1 : 0;
+    if (run == want) {
+      first = at + 1 - want;
+      break;
+    }
+  }
+  if (first == used && want > EDEN_HEAP_PIECES - used)
+    return held != 0;
+  void *start = (char *)ps5_heap_base + ((size_t)first << EDEN_HEAP_PIECE_SHIFT);
+  if (eden_heap_commit(start, (size_t)want << EDEN_HEAP_PIECE_SHIFT) != 0) {
+    atomic_fetch_add_explicit(&eden_heap_hold_spare_refused, 1, memory_order_relaxed);
+    return held != 0;
+  }
+  /* 3: the spare's (committed, no space over it; nothing is ever freed into it). */
+  for (unsigned piece = first; piece < first + want; ++piece)
+    atomic_store_explicit(&eden_heap_piece_state[piece], 3, memory_order_relaxed);
+  if (first == used)
+    atomic_store_explicit(&eden_heap_pieces_used, used + want, memory_order_relaxed);
+  eden_heap_hold_run_first[slot_run] = first;
+  eden_heap_hold_run_span[slot_run] = want;
+  atomic_store_explicit(&eden_heap_hold_spare_now, held + want, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_hold_spare_taken, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_hold_spare_taken_mib, (unsigned long long)want << (EDEN_HEAP_PIECE_SHIFT - 20),
+                            memory_order_relaxed);
+  return 1;
+}
+
+static void eden_heap_hold_fill(void) {
+  const unsigned want = atomic_load_explicit(&eden_heap_hold_spare_pieces_want, memory_order_relaxed);
+  const unsigned now = atomic_load_explicit(&eden_heap_hold_spare_now, memory_order_relaxed);
+  /* Off: only an empty spare is filled (T177); T178b refill: one that holds less than its size too. */
+  const int refill = atomic_load_explicit(&eden_heap_hold_refill_bytes, memory_order_relaxed) != 0;
+  if (atomic_load_explicit(&ps5_heap_state, memory_order_acquire) != 2 || want == 0 ||
+      (refill ? now >= want : now != 0))
+    return;
+  atomic_store_explicit(&eden_heap_hold_last_fill_us, (unsigned long long)sceKernelGetProcessTime(),
+                        memory_order_relaxed);
+  eden_heap_grow_acquire();
+  (void)eden_heap_hold_fill_locked();
+  atomic_flag_clear_explicit(&eden_heap_grow_lock, memory_order_release);
+}
+
+/* For eden_heap_grow's test, under the growth lock: could the spare serve `pieces`? */
+static int eden_heap_hold_spare_fits(size_t pieces) {
+  return eden_heap_hold_run_for_locked(pieces) != EDEN_HEAP_HOLD_RUNS;
+}
+
+/* For eden_heap_grow, under the growth lock, after the pool refused `pieces`: the spare's range when
+ * it is that large. Off: a run is taken whole, its pieces become the new space (T177). T178b refill: only
+ * `pieces` of the smallest run that has them (its first ones); the rest stays a spare. */
+static int eden_heap_hold_spare_take(size_t pieces, size_t bytes, unsigned *first, size_t *span) {
+  const unsigned run = eden_heap_hold_run_for_locked(pieces);
+  if (run == EDEN_HEAP_HOLD_RUNS)
+    return 0;
+  const int partial = atomic_load_explicit(&eden_heap_hold_refill_bytes, memory_order_relaxed) != 0;
+  *first = eden_heap_hold_run_first[run];
+  *span = partial ? pieces : eden_heap_hold_run_span[run];
+  eden_heap_hold_run_first[run] += (unsigned)*span;
+  eden_heap_hold_run_span[run] -= (unsigned)*span;
+  if (eden_heap_hold_run_span[run] == 0)
+    eden_heap_hold_run_first[run] = 0;
+  const unsigned left = eden_heap_hold_spare_total_locked();
+  atomic_store_explicit(&eden_heap_hold_spare_now, left, memory_order_relaxed);
+  if (left != 0)
+    atomic_fetch_add_explicit(&eden_heap_hold_served_partial, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_hold_served, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_hold_served_bytes, bytes, memory_order_relaxed);
+  if (eden_heap_hold_active((unsigned long long)sceKernelGetProcessTime()))
+    atomic_fetch_add_explicit(&eden_heap_hold_served_in_hold, 1, memory_order_relaxed);
+  return 1;
+}
+
+/* main (heap_pages.cpp): the switch, and the spare's size in MiB (32 or 64; 0: none). */
+void eden_heap_set_hold(unsigned seconds, unsigned spare_mib) {
+  atomic_store_explicit(&eden_heap_hold_spare_pieces_want, spare_mib >> (EDEN_HEAP_PIECE_SHIFT - 20),
+                        memory_order_relaxed);
+  /* T178b EDEN_UP_HEAP_HOLD_REFILL_MIB (above): read here, with the hold's own switches (main, before
+   * any game thread). Digits only, 32 to 4096; anything else: off. */
+  unsigned long long refill_mib = 0;
+  const char *refill = getenv("EDEN_UP_HEAP_HOLD_REFILL_MIB");
+  if (seconds != 0 && refill != NULL && *refill != '\0') {
+    const char *at = refill;
+    while (*at >= '0' && *at <= '9' && refill_mib <= 4096)
+      refill_mib = refill_mib * 10 + (unsigned long long)(*at++ - '0');
+    if (*at != '\0' || refill_mib < 32 || refill_mib > 4096)
+      refill_mib = 0;
+    if (refill_mib != 0)
+      fprintf(stderr,
+              "EDEN_UP_HEAP_HOLD_REFILL_MIB=%s: a refused growth takes only the spare's pieces it needs, and the "
+              "spare is topped up whenever the pool has a free block of that many MiB, in a hold too\n",
+              refill);
+    else
+      fprintf(stderr, "EDEN_UP_HEAP_HOLD_REFILL_MIB=%s is not 32 to 4096: off\n", refill);
+  }
+  atomic_store_explicit(&eden_heap_hold_refill_bytes, refill_mib << 20, memory_order_relaxed);
+  atomic_store_explicit(&eden_heap_hold_seconds, seconds, memory_order_relaxed);
+  if (seconds != 0)
+    eden_heap_hold_fill();
+}
+
+/* A hold begins or goes on for <s> s from now. 1: it began now (none was running); 0: it went on,
+ * or the switch is off. */
+int eden_heap_hold_begin(void) {
+  const unsigned seconds = atomic_load_explicit(&eden_heap_hold_seconds, memory_order_relaxed);
+  if (seconds == 0)
+    return 0;
+  const unsigned long long now = (unsigned long long)sceKernelGetProcessTime();
+  const unsigned long long span_us = (unsigned long long)seconds * 1000000ull;
+  const int began = !eden_heap_hold_active(now);
+  unsigned long long since = atomic_load_explicit(&eden_heap_hold_since_us, memory_order_relaxed);
+  if (began) {
+    /* After a hold that ran its longest, <s> s with none. */
+    if (now < atomic_load_explicit(&eden_heap_hold_quiet_until_us, memory_order_relaxed))
+      return 0;
+    since = now;
+    atomic_store_explicit(&eden_heap_hold_since_us, since, memory_order_relaxed);
+  }
+  /* At most 3 x <s> s in one hold, however often it is extended. */
+  unsigned long long until = now + span_us;
+  if (until > since + 3 * span_us) {
+    until = since + 3 * span_us;
+    if (atomic_exchange_explicit(&eden_heap_hold_quiet_until_us, until + span_us, memory_order_relaxed) !=
+        until + span_us)
+      atomic_fetch_add_explicit(&eden_heap_hold_capped, 1, memory_order_relaxed);
+  }
+  atomic_store_explicit(&eden_heap_hold_until_us, until, memory_order_relaxed);
+  /* No spare taken here: a hold begins when the pool is already short, and the driver may be waiting
+   * for that memory. The spare is taken while the pool has room (eden_heap_set_hold, refill). */
+  if (began)
+    atomic_fetch_add_explicit(&eden_heap_hold_begun, 1, memory_order_relaxed);
+  return began;
+}
+
+/* The texture cache (0893): an area change began or goes on. */
+void eden_heap_hold_area(void) {
+  if (eden_heap_hold_begin())
+    atomic_fetch_add_explicit(&eden_heap_hold_begun_area, 1, memory_order_relaxed);
+}
+
+/* The memory report (performance.cpp), with the pool's largest free block: the spare again, at
+ * most every 2 s, while the pool has 256 MiB in one block and no hold runs. */
+static void eden_heap_hold_refill_report(unsigned long long now);
+void eden_heap_hold_refill(unsigned long long largest_free) {
+  if (atomic_load_explicit(&eden_heap_hold_seconds, memory_order_relaxed) == 0)
+    return;
+  /* T178b EDEN_UP_HEAP_HOLD_REFILL_MIB: the missing pieces as soon as the pool has a block of <n> MiB, in a
+   * hold too, one try every 250 ms at most; and its line. Off: as T177 below. */
+  const unsigned long long refill_bytes = atomic_load_explicit(&eden_heap_hold_refill_bytes, memory_order_relaxed);
+  if (refill_bytes != 0) {
+    const unsigned long long now = (unsigned long long)sceKernelGetProcessTime();
+    const unsigned before = atomic_load_explicit(&eden_heap_hold_spare_now, memory_order_relaxed);
+    if (before < atomic_load_explicit(&eden_heap_hold_spare_pieces_want, memory_order_relaxed) &&
+        largest_free >= refill_bytes &&
+        now - atomic_load_explicit(&eden_heap_hold_refill_last_us, memory_order_relaxed) >= 250000ull) {
+      atomic_store_explicit(&eden_heap_hold_refill_last_us, now, memory_order_relaxed);
+      atomic_fetch_add_explicit(&eden_heap_hold_refill_tries, 1, memory_order_relaxed);
+      eden_heap_hold_fill();
+      if (atomic_load_explicit(&eden_heap_hold_spare_now, memory_order_relaxed) > before) {
+        atomic_fetch_add_explicit(&eden_heap_hold_refills, 1, memory_order_relaxed);
+        if (eden_heap_hold_active(now))
+          atomic_fetch_add_explicit(&eden_heap_hold_refills_in_hold, 1, memory_order_relaxed);
+      }
+    }
+    eden_heap_hold_refill_report(now);
+    return;
+  }
+  if (atomic_load_explicit(&eden_heap_hold_spare_now, memory_order_relaxed) != 0 ||
+      largest_free < ((unsigned long long)256 << 20))
+    return;
+  const unsigned long long now = (unsigned long long)sceKernelGetProcessTime();
+  if (eden_heap_hold_active(now) ||
+      now - atomic_load_explicit(&eden_heap_hold_last_fill_us, memory_order_relaxed) < 2000000ull)
+    return;
+  eden_heap_hold_fill();
+}
+
+/* T178b: the refill's line, every 10 s while its counts move (from eden_heap_hold_refill: the memory
+ * report's thread, no lock of the heap held). */
+static void eden_heap_hold_refill_report(unsigned long long now) {
+  const unsigned long long last = atomic_load_explicit(&eden_heap_hold_refill_reported_us, memory_order_relaxed);
+  if (last != 0 && now - last < 10000000ull)
+    return;
+  const unsigned long long tries = atomic_load_explicit(&eden_heap_hold_refill_tries, memory_order_relaxed);
+  const unsigned long long refills = atomic_load_explicit(&eden_heap_hold_refills, memory_order_relaxed);
+  const unsigned long long in_hold = atomic_load_explicit(&eden_heap_hold_refills_in_hold, memory_order_relaxed);
+  const unsigned long long partial = atomic_load_explicit(&eden_heap_hold_served_partial, memory_order_relaxed);
+  const unsigned long long served = atomic_load_explicit(&eden_heap_hold_served, memory_order_relaxed);
+  const unsigned long long refused = atomic_load_explicit(&eden_heap_hold_spare_refused, memory_order_relaxed);
+  const unsigned long long sum = tries + refills + in_hold + partial + served + refused;
+  atomic_store_explicit(&eden_heap_hold_refill_reported_us, now, memory_order_relaxed);
+  if (last != 0 && sum == atomic_load_explicit(&eden_heap_hold_refill_reported_sum, memory_order_relaxed))
+    return;
+  atomic_store_explicit(&eden_heap_hold_refill_reported_sum, sum, memory_order_relaxed);
+  char line[320];
+  const int length = snprintf(
+      line, sizeof(line),
+      "EDEN_UP_HEAP_HOLD_REFILL at %llu MiB: spare %llu of %llu MiB; refills %llu (%llu in a hold) of %llu tries, "
+      "refused by the pool %llu; served %llu growths, %llu of them leaving pieces for the next\n",
+      atomic_load_explicit(&eden_heap_hold_refill_bytes, memory_order_relaxed) >> 20,
+      (unsigned long long)atomic_load_explicit(&eden_heap_hold_spare_now, memory_order_relaxed)
+          << (EDEN_HEAP_PIECE_SHIFT - 20),
+      (unsigned long long)atomic_load_explicit(&eden_heap_hold_spare_pieces_want, memory_order_relaxed)
+          << (EDEN_HEAP_PIECE_SHIFT - 20),
+      refills, in_hold, tries, refused, served, partial);
+  if (length > 0)
+    fputs(line, stderr);
+}
+
+/* For the EDEN_UP_HEAP_HOLD line: 0 when off, else 1 and the counts. */
+int eden_heap_hold_stats(unsigned long long *values, unsigned count) {
+  const unsigned seconds = atomic_load_explicit(&eden_heap_hold_seconds, memory_order_relaxed);
+  if (seconds == 0)
+    return 0;
+  const unsigned long long now = (unsigned long long)sceKernelGetProcessTime();
+  const unsigned long long until = atomic_load_explicit(&eden_heap_hold_until_us, memory_order_relaxed);
+  const unsigned long long all[14] = {
+      seconds,
+      eden_heap_hold_active(now) ? (until - now) / 1000000ull + 1 : 0,
+      atomic_load_explicit(&eden_heap_hold_begun, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_trims_kept, memory_order_relaxed),
+      (unsigned long long)atomic_load_explicit(&eden_heap_hold_spare_now, memory_order_relaxed)
+          << (EDEN_HEAP_PIECE_SHIFT - 20),
+      atomic_load_explicit(&eden_heap_hold_spare_taken, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_spare_taken_mib, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_spare_refused, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_served, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_served_bytes, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_served_in_hold, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_begun_area, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_capped, memory_order_relaxed),
+      atomic_load_explicit(&eden_heap_hold_unheld_trims, memory_order_relaxed),
+  };
+  for (unsigned i = 0; i < count && i < 14u; ++i)
+    values[i] = all[i];
+  return 1;
+}
+
 /* Adds a space with room for `bytes`: memory for pieces of the range (pieces given back earlier
  * first, else the next ones) and an mspace over them, in a slot given back earlier or a new one.
  * `seen` is the growth the caller tried after: when another thread grew the heap meanwhile, that
@@ -928,22 +1363,33 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
   if (atomic_load_explicit(&eden_heap_space_generation, memory_order_relaxed) != seen) {
     grown = 1;
   } else if (eden_heap_grows && need > bytes && slot < EDEN_HEAP_PIECES &&
-             (first < used || pieces <= EDEN_HEAP_PIECES - used)) {
+             ((first < used || pieces <= EDEN_HEAP_PIECES - used) ||
+              eden_heap_hold_spare_fits(pieces))) {
+    /* `span`: the pieces of the new space (`pieces`, or the spare's when it serves). */
+    size_t span = pieces;
     void *start = (char *)ps5_heap_base + ((size_t)first << EDEN_HEAP_PIECE_SHIFT);
-    const size_t size = pieces << EDEN_HEAP_PIECE_SHIFT;
-    if (!eden_heap_test_no_grow() && eden_heap_commit(start, size) == 0) {
+    size_t size = span << EDEN_HEAP_PIECE_SHIFT;
+    int ready = (first < used || pieces <= EDEN_HEAP_PIECES - used) && !eden_heap_test_no_grow() &&
+                eden_heap_commit(start, size) == 0;
+    /* EDEN_UP_HEAP_HOLD_AT_LOAD: the pool said no; the spare (committed earlier) is the space. */
+    if (!ready && eden_heap_hold_spare_take(pieces, bytes, &first, &span)) {
+      start = (char *)ps5_heap_base + ((size_t)first << EDEN_HEAP_PIECE_SHIFT);
+      size = span << EDEN_HEAP_PIECE_SHIFT;
+      ready = 1;
+    }
+    if (ready) {
       void *space = sceLibcMspaceCreate("Eden-heap", start, size, 0);
       atomic_fetch_add_explicit(&eden_heap_committed_bytes, size, memory_order_relaxed);
       if (first == used)
-        atomic_store_explicit(&eden_heap_pieces_used, used + (unsigned)pieces, memory_order_relaxed);
+        atomic_store_explicit(&eden_heap_pieces_used, used + (unsigned)span, memory_order_relaxed);
       if (space != NULL) {
-        for (size_t piece = first; piece < first + pieces; ++piece) {
+        for (size_t piece = first; piece < first + span; ++piece) {
           atomic_store_explicit(&eden_heap_piece_space[piece], space, memory_order_release);
           atomic_store_explicit(&eden_heap_piece_slot[piece], slot, memory_order_release);
           atomic_store_explicit(&eden_heap_piece_state[piece], 0, memory_order_relaxed);
         }
         eden_heap_space_first[slot] = first;
-        eden_heap_space_span[slot] = (unsigned)pieces;
+        eden_heap_space_span[slot] = (unsigned)span;
         atomic_store_explicit(&eden_heap_space_blocks[slot], 0, memory_order_relaxed);
         atomic_store_explicit(&eden_heap_space_class[slot],
                               getenv("EDEN_HEAP_SCRATCH_SPACES") != NULL ? eden_heap_request_class(bytes) : EDEN_HEAP_CLASS_ANY,
@@ -954,7 +1400,7 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
         else
           atomic_store_explicit(&eden_heap_space_retired[slot], 0, memory_order_seq_cst);
         atomic_fetch_add_explicit(&eden_heap_space_generation, 1, memory_order_release);
-        eden_heap_note_growth(bytes, (unsigned)pieces);
+        eden_heap_note_growth(bytes, (unsigned)span);
         /* EDEN_UP_HEAP_STEAL mode 3: the pool gave again, so growth comes before the idle arenas. */
         if (atomic_load_explicit(&eden_heap_steal_mode, memory_order_relaxed) >= 3)
           atomic_store_explicit(&eden_heap_steal_pool_no_us, 0, memory_order_relaxed);
@@ -963,7 +1409,7 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
         /* The memory stays committed but no space is over it: given back at once. */
         if (eden_heap_decommit(start, size) == 1) {
           atomic_fetch_sub_explicit(&eden_heap_committed_bytes, size, memory_order_relaxed);
-          for (size_t piece = first; piece < first + pieces; ++piece)
+          for (size_t piece = first; piece < first + span; ++piece)
             atomic_store_explicit(&eden_heap_piece_state[piece], 1, memory_order_relaxed);
         }
         atomic_store_explicit(&eden_heap_grow_why, EDEN_HEAP_WHY_NO_SPACE, memory_order_relaxed);
@@ -987,13 +1433,22 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
 /* Gives the memory of every space (but the first) that holds no block back to the system: the
  * space is retired, its memory released, its address space kept for a later growth. Returns the
  * bytes given back. */
-size_t eden_heap_trim(void) {
+static size_t eden_heap_trim_with(int hold_applies) {
   if (atomic_load_explicit(&ps5_heap_state, memory_order_acquire) != 2)
     return 0;
   /* Empty arenas to the spares first (their memory stays in their spaces). */
   eden_heap_return_arenas();
   if (!eden_heap_grows)
     return 0;
+  /* EDEN_UP_HEAP_HOLD_AT_LOAD: through an area load nothing leaves the heap, but for the game. */
+  if (atomic_load_explicit(&eden_heap_hold_seconds, memory_order_relaxed) != 0 &&
+      eden_heap_hold_active((unsigned long long)sceKernelGetProcessTime())) {
+    if (hold_applies) {
+      atomic_fetch_add_explicit(&eden_heap_hold_trims_kept, 1, memory_order_relaxed);
+      return 0;
+    }
+    atomic_fetch_add_explicit(&eden_heap_hold_unheld_trims, 1, memory_order_relaxed);
+  }
   eden_heap_grow_acquire();
   size_t returned = 0;
   const unsigned count = atomic_load_explicit(&eden_heap_space_count, memory_order_relaxed);
@@ -1029,6 +1484,12 @@ size_t eden_heap_trim(void) {
   atomic_fetch_add_explicit(&eden_heap_returned_bytes, returned, memory_order_relaxed);
   return returned;
 }
+
+size_t eden_heap_trim(void) { return eden_heap_trim_with(1); }
+
+/* The guest's block wait, the JIT code cache's waits and operator new's waits: as eden_heap_trim, and
+ * a hold (EDEN_UP_HEAP_HOLD_AT_LOAD) does not stop it. */
+size_t eden_heap_trim_unheld(void) { return eden_heap_trim_with(0); }
 
 /* A block from the heap's spaces, then from a new one, and when there is no memory for one, from
  * a space of the other class. A small request starts at the space that served the last one (it is
@@ -1251,6 +1712,8 @@ static struct eden_heap_thread *eden_heap_self(void) {
     self->pending = 0;
     self->retry = 0;  /* its arenas (own) stay: this thread uses them */
     self->steal = 0;  /* EDEN_UP_HEAP_STEAL: the last thread's hint is not this one's */
+    eden_heap_ll_depth[i] = 0; /* RADV_PS5_LONGLIVED_ARENA: an ended thread's scopes are not this one's */
+    eden_heap_ll_retry[i] = 0;
     __atomic_store_n(&self->name[0], 0, __ATOMIC_RELAXED);
     if (pthread_setspecific(eden_heap_arena_key, self) != 0) {
       atomic_store_explicit(&eden_heap_thread_used[i], 0, memory_order_release);
@@ -1261,7 +1724,61 @@ static struct eden_heap_thread *eden_heap_self(void) {
   return NULL;
 }
 
+/* EDEN_UP_BUILD_BURST_LOG: a token is valid only from begin until the matching end, while its
+ * thread lives. Nested scopes share the outer build's baseline and high-water mark. Nothing here
+ * claims a record or allocates. */
+unsigned eden_build_heap_begin(void) {
+  struct eden_heap_thread *self = eden_heap_self();
+  if (self == NULL)
+    return 0;
+  struct eden_build_heap_record *r = &eden_build_heap_records[self - eden_heap_threads];
+  if (r->depth++ == 0) {
+    atomic_store_explicit(&r->base, atomic_load_explicit(&r->net, memory_order_relaxed), memory_order_relaxed);
+    atomic_store_explicit(&r->allocated_base, atomic_load_explicit(&r->allocated, memory_order_relaxed), memory_order_relaxed);
+    atomic_store_explicit(&r->peak, 0, memory_order_relaxed);
+  }
+  return (unsigned)(self - eden_heap_threads) + 1;
+}
+void eden_build_heap_read(unsigned token, long long *net,
+                          unsigned long long *allocated, unsigned long long *peak) {
+  if (token == 0 || token > EDEN_HEAP_THREADS)
+    return;
+  const struct eden_build_heap_record *r = &eden_build_heap_records[token - 1];
+  if (net) *net = atomic_load_explicit(&r->net, memory_order_relaxed) - atomic_load_explicit(&r->base, memory_order_relaxed);
+  if (allocated) *allocated = atomic_load_explicit(&r->allocated, memory_order_relaxed) - atomic_load_explicit(&r->allocated_base, memory_order_relaxed);
+  if (peak) *peak = (unsigned long long)atomic_load_explicit(&r->peak, memory_order_relaxed);
+}
+void eden_build_heap_end(unsigned token) {
+  if (token && token <= EDEN_HEAP_THREADS) {
+    struct eden_build_heap_record *r = &eden_build_heap_records[token - 1];
+    if (r->depth) --r->depth;
+  }
+}
+/* EDEN_UP_BUILD_BURST_LOG, read only: record `rec`'s heap pieces grown for its requests (the
+ * existing `grown`, in 32 MiB pieces, bumped in eden_heap_note_growth), its sidecar net bytes
+ * (inside build scopes only) and its thread name (16 bytes, 0-terminated). Returns 0 when `rec` is
+ * past the table. No claim, no lock, no allocation. */
+int eden_heap_record_growth(unsigned rec, unsigned *grown, long long *net, char name[16]) {
+  if (rec >= EDEN_HEAP_THREADS)
+    return 0;
+  const struct eden_heap_thread *thread = &eden_heap_threads[rec];
+  if (grown) *grown = __atomic_load_n(&thread->grown, __ATOMIC_RELAXED);
+  if (net) *net = atomic_load_explicit(&eden_build_heap_records[rec].net, memory_order_relaxed);
+  if (name) {
+    for (unsigned i = 0; i < sizeof(thread->name); ++i)
+      name[i] = __atomic_load_n(&thread->name[i], __ATOMIC_RELAXED);
+    name[sizeof(thread->name) - 1] = 0;
+  }
+  return 1;
+}
+/* EDEN_UP_BUILD_BURST_LOG, read only: requests that did not go to an arena and were under 1 MiB
+ * (EDEN_HEAP_CLASSES under1M), since start. */
+unsigned long long eden_heap_under1m_count(void) {
+  return (unsigned long long)atomic_load_explicit(&eden_heap_class_count[0], memory_order_relaxed);
+}
+
 static void eden_heap_charge(struct eden_heap_thread *self, long bytes, long blocks) {
+  eden_build_heap_charge(self, bytes);
   self->live += bytes;
   self->blocks += blocks;
   if (++self->pending >= 64 || self->live > (1l << 20) || self->live < -(1l << 20))
@@ -1299,6 +1816,18 @@ static void eden_heap_keep_arena(struct eden_heap_thread *self, void *arena) {
   __atomic_store_n(&self->owned, owned + 1, __ATOMIC_RELEASE);
 }
 
+/* RADV_PS5_LONGLIVED_ARENA=1: 1 when the list's entry `index` is an arena of the long-lived set (by
+ * the slot of its first block, as eden_heap_ll_allocate marks it). Off: 0 after one load. */
+static int eden_heap_ll_listed(unsigned index) {
+  if (!atomic_load_explicit(&eden_heap_ll_on, memory_order_relaxed))
+    return 0;
+  const void *block = atomic_load_explicit(&eden_heap_arena_blocks_probe[index], memory_order_relaxed);
+  if (block == NULL)
+    return 0;
+  const uintptr_t slot = eden_heap_slot(block);
+  return slot < EDEN_HEAP_SLOTS && atomic_load_explicit(&eden_heap_ll_slot[slot], memory_order_relaxed) != 0;
+}
+
 /* This thread's arena, created on its first small allocation. NULL = the heap's own spaces. */
 static void *eden_heap_thread_arena(void) {
   struct eden_heap_thread *self = eden_heap_self();
@@ -1309,10 +1838,14 @@ static void *eden_heap_thread_arena(void) {
   eden_heap_create_acquire();
   void *arena = eden_heap_create_arena_locked(1);
   if (arena == NULL) {
-    /* Arena limit reached: share the existing arenas round-robin (past the entries given back). */
+    /* Arena limit reached: share the existing arenas round-robin (past the entries given back, and
+     * past the long-lived set's: RADV_PS5_LONGLIVED_ARENA=1, kept objects only). */
     const unsigned count = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
-    for (unsigned i = 0; i < count && arena == NULL; ++i)
-      arena = eden_heap_arena_list[atomic_fetch_add_explicit(&eden_heap_next_shared, 1, memory_order_relaxed) % count];
+    for (unsigned i = 0; i < count && arena == NULL; ++i) {
+      const unsigned index = atomic_fetch_add_explicit(&eden_heap_next_shared, 1, memory_order_relaxed) % count;
+      if (!eden_heap_ll_listed(index))
+        arena = eden_heap_arena_list[index];
+    }
   } else if (self->owned < EDEN_HEAP_THREAD_ARENAS) {
     eden_heap_keep_arena(self, arena);
   }
@@ -1329,8 +1862,217 @@ static void *eden_heap_arena_try(void *arena, size_t count, size_t size, int zer
   return address;
 }
 
+/* ---- RADV_PS5_LONGLIVED_ARENA (the switch's text is with its data, above eden_heap_apply) ---- */
+
+void eden_heap_set_long_lived(int mode) {
+  atomic_store_explicit(&eden_heap_ll_mode, mode, memory_order_relaxed);
+  atomic_store_explicit(&eden_heap_ll_on, mode == 1, memory_order_relaxed);
+  atomic_store_explicit(&eden_heap_ll_track, mode == 0 || mode == 1, memory_order_relaxed);
+}
+
+/* The driver's scopes (lead-mesh-42, weak there). Nested scopes count; off: one load and return. */
+void eden_heap_long_lived_enter(void) {
+  if (!atomic_load_explicit(&eden_heap_ll_track, memory_order_relaxed))
+    return;
+  struct eden_heap_thread *self = eden_heap_self();
+  if (self == NULL)
+    return;
+  if (eden_heap_ll_depth[self - eden_heap_threads]++ == 0)
+    atomic_fetch_add_explicit(&eden_heap_ll_scopes, 1, memory_order_relaxed);
+}
+
+void eden_heap_long_lived_leave(void) {
+  if (!atomic_load_explicit(&eden_heap_ll_track, memory_order_relaxed))
+    return;
+  struct eden_heap_thread *self = eden_heap_self();
+  if (self != NULL && eden_heap_ll_depth[self - eden_heap_threads] != 0)
+    --eden_heap_ll_depth[self - eden_heap_threads];
+}
+
+/* 1: this thread is inside a long-lived scope and the switch routes. */
+static int eden_heap_ll_active(void) {
+  if (!atomic_load_explicit(&eden_heap_ll_on, memory_order_relaxed))
+    return 0;
+  struct eden_heap_thread *self = eden_heap_self();
+  return self != NULL && eden_heap_ll_depth[self - eden_heap_threads] != 0;
+}
+
+/* A small request's routing (the two places that route; the thread cache's checks use
+ * eden_heap_ll_active): inside a scope, counted (modes 0 and 1), and 1 when mode 1 routes it. */
+static int eden_heap_ll_route(size_t bytes) {
+  if (!atomic_load_explicit(&eden_heap_ll_track, memory_order_relaxed))
+    return 0;
+  struct eden_heap_thread *self = eden_heap_self();
+  if (self == NULL || eden_heap_ll_depth[self - eden_heap_threads] == 0)
+    return 0;
+  atomic_fetch_add_explicit(&eden_heap_ll_requests, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_ll_bytes, bytes, memory_order_relaxed);
+  return atomic_load_explicit(&eden_heap_ll_on, memory_order_relaxed);
+}
+
+/* 1: an arena of the long-lived set (so no thread adopts it). Off: 0 after one load. */
+static int eden_heap_is_long_lived(const void *arena) {
+  if (!atomic_load_explicit(&eden_heap_ll_on, memory_order_relaxed))
+    return 0;
+  const unsigned count = atomic_load_explicit(&eden_heap_ll_count, memory_order_acquire);
+  for (unsigned i = 0; i < count; ++i)
+    if (atomic_load_explicit(&eden_heap_ll_arena[i], memory_order_relaxed) == arena)
+      return 1;
+  return 0;
+}
+
+/* 1: a block (in the heap's range) of a long-lived arena; it skips the thread cache when freed. */
+static int eden_heap_ll_block(const void *address) {
+  if (!atomic_load_explicit(&eden_heap_ll_on, memory_order_relaxed))
+    return 0;
+  const uintptr_t slot = eden_heap_slot(address);
+  return slot < EDEN_HEAP_SLOTS && atomic_load_explicit(&eden_heap_ll_slot[slot], memory_order_relaxed) != 0;
+}
+
+static void *eden_heap_ll_try(void *arena, size_t count, size_t size, int zero, size_t alignment) {
+  if (alignment == 0)
+    return eden_heap_arena_try(arena, count, size, zero);
+  void *block = NULL;
+  if (sceLibcMspacePosixMemalign(arena, &block, alignment, size) != 0 || block == NULL)
+    return NULL;
+  eden_heap_arena_took(block);
+  return block;
+}
+
+/* A block for a kept object from the long-lived set: the entry asked last, then the others, then a
+ * new arena (a spare first: eden_heap_create_arena_locked). NULL: the caller's usual path takes it
+ * (the set is full, no memory for one more, or the creation lock is this thread's). Under the
+ * creation lock past the first try, as eden_heap_arena_allocate. `alignment` 0: malloc/calloc. */
+static void *eden_heap_ll_allocate(size_t count, size_t size, int zero, size_t alignment) {
+  unsigned made = atomic_load_explicit(&eden_heap_ll_count, memory_order_acquire);
+  unsigned current = atomic_load_explicit(&eden_heap_ll_current, memory_order_relaxed);
+  if (current < made) {
+    void *address = eden_heap_ll_try(atomic_load_explicit(&eden_heap_ll_arena[current], memory_order_relaxed),
+                                     count, size, zero, alignment);
+    if (address != NULL)
+      return address;
+  }
+  if (atomic_load_explicit(&eden_heap_create_holder, memory_order_relaxed) == (unsigned long)pthread_self()) {
+    atomic_fetch_add_explicit(&eden_heap_ll_fallbacks, 1, memory_order_relaxed);
+    return NULL; /* the lock is not recursive */
+  }
+  /* Back-off (as eden_heap_arena_allocate's retry): after a search that found nothing, this thread's
+   * next EDEN_HEAP_ARENA_RETRY requests try the current arena only, without the creation lock. */
+  struct eden_heap_thread *self = eden_heap_self();
+  unsigned *retry = self != NULL ? &eden_heap_ll_retry[self - eden_heap_threads] : NULL;
+  if (retry != NULL && *retry != 0) {
+    --*retry;
+    atomic_fetch_add_explicit(&eden_heap_ll_fallbacks, 1, memory_order_relaxed);
+    return NULL;
+  }
+  void *address = NULL;
+  eden_heap_create_acquire();
+  made = atomic_load_explicit(&eden_heap_ll_count, memory_order_relaxed);
+  for (unsigned i = 0; i < made && address == NULL; ++i) {
+    if (i == current)
+      continue;
+    address = eden_heap_ll_try(atomic_load_explicit(&eden_heap_ll_arena[i], memory_order_relaxed), count, size, zero,
+                               alignment);
+    if (address != NULL)
+      atomic_store_explicit(&eden_heap_ll_current, i, memory_order_relaxed);
+  }
+  /* A new arena (2 MiB) only for a request under EDEN_HEAP_ARENA_GROW_REQUEST, as a thread's own. */
+  if (address == NULL && made < EDEN_HEAP_LL_ARENAS && count * size < EDEN_HEAP_ARENA_GROW_REQUEST) {
+    void *fresh = eden_heap_create_arena_locked(0);
+    if (fresh != NULL) {
+      /* Its slot, as eden_heap_return_record finds it: by its entry in the list. */
+      const unsigned listed = atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
+      unsigned index = 0;
+      while (index < listed && eden_heap_arena_list[index] != fresh)
+        ++index;
+      void *block = index < listed ? atomic_load_explicit(&eden_heap_arena_blocks_probe[index], memory_order_relaxed)
+                                   : NULL;
+      if (block != NULL)
+        atomic_store_explicit(&eden_heap_ll_slot[eden_heap_slot(block)], 1, memory_order_relaxed);
+      atomic_store_explicit(&eden_heap_ll_arena[made], fresh, memory_order_relaxed);
+      atomic_store_explicit(&eden_heap_ll_count, made + 1, memory_order_release);
+      atomic_store_explicit(&eden_heap_ll_current, made, memory_order_relaxed);
+      address = eden_heap_ll_try(fresh, count, size, zero, alignment);
+    }
+  }
+  eden_heap_create_release();
+  if (address == NULL) {
+    atomic_fetch_add_explicit(&eden_heap_ll_fallbacks, 1, memory_order_relaxed);
+    if (retry != NULL)
+      *retry = EDEN_HEAP_ARENA_RETRY;
+  }
+  return address;
+}
+
+/* One line of numbers (MiB): what the heap holds and uses, its slack, the slack in whole free 2 MiB
+ * pages (what a page give-back could return) and the rest ("pinned": room in pages a live block
+ * keeps), the arenas and spares, and the long-lived set (arenas, bytes live in them, requests, the
+ * requests it left to the usual path, scopes entered). No allocation, no lock. */
+static void eden_heap_ll_snapshot(char *out, size_t room) {
+  size_t held = 0, in_use = 0, returned = 0, free_pages = 0, idle_arenas = 0, live = 0;
+  eden_heap_usage(&held, &in_use, &returned);
+  eden_heap_page_usage(&free_pages, &idle_arenas, &live);
+  const size_t slack = held > in_use ? held - in_use : 0;
+  const size_t pinned = slack > free_pages ? slack - free_pages : 0;
+  const unsigned made = atomic_load_explicit(&eden_heap_ll_count, memory_order_acquire);
+  long ll_live = 0;
+  for (uintptr_t slot = 0; slot < EDEN_HEAP_SLOTS; ++slot)
+    if (atomic_load_explicit(&eden_heap_ll_slot[slot], memory_order_relaxed) != 0)
+      ll_live += atomic_load_explicit(&eden_page_live[slot], memory_order_relaxed);
+  snprintf(out, room,
+           "held=%zu in_use=%zu slack=%zu free_pages=%zu idle_arena_pages=%zu pinned=%zu arenas=%u spare=%u "
+           "ll_arenas=%u ll_live=%ld ll_bytes=%llu ll_requests=%llu ll_fallbacks=%llu ll_scopes=%llu (MiB)",
+           held >> 20, in_use >> 20, slack >> 20, free_pages >> 20, idle_arenas >> 20, pinned >> 20,
+           eden_heap_arenas_created(), eden_heap_arenas_spare(), made, (ll_live > 0 ? ll_live : 0) >> 20,
+           (unsigned long long)(atomic_load_explicit(&eden_heap_ll_bytes, memory_order_relaxed) >> 20),
+           (unsigned long long)atomic_load_explicit(&eden_heap_ll_requests, memory_order_relaxed),
+           (unsigned long long)atomic_load_explicit(&eden_heap_ll_fallbacks, memory_order_relaxed),
+           (unsigned long long)atomic_load_explicit(&eden_heap_ll_scopes, memory_order_relaxed));
+}
+
 static atomic_uint eden_heap_adopt_next;
 static atomic_ullong eden_heap_adopted, eden_heap_adopt_misses;
+
+/* EDEN_UP_HEAP_ADOPT_WIDE=<n> (0880, our own; 17 to 1024, unset or 0: off; read from main in
+ * eden_heap_pool_init): a thread out of room asks up to n arenas no thread is on before it makes a
+ * new one, instead of EDEN_HEAP_ADOPT_TRIES (16). The 10:17 session of 13 Nov (T165,
+ * its crash log) made 112 new arenas in play (EDEN_HEAP_GROWTH arenas=265 at
+ * line 404, 377 at line 9117), every one after a miss of the 16 asks (adopt_misses 79 -> 191), while
+ * 377 arenas held 200 MiB of room (EDEN_HEAP_SLACK, line 8447; record 0 alone 81 MiB in 128 arenas,
+ * line 8431). The heap's pieces grew 1344 -> 1536 MiB in play and nothing of it ever went back (a
+ * trim needs a space with no block; every space held arenas, EDEN_HEAP_SPACES 8443-8446). Same room
+ * test (EDEN_HEAP_ADOPT_ROOM), same lock, same slack gate; only the number of arenas asked differs.
+ * Its price: up to n mspace calls (a malloc and a free each) under the creation lock at a miss.
+ * Counted (asks past the 16th, arenas taken there, time in those asks) in "EDEN_HEAP_ADOPT_WIDE" after
+ * the 20 s EDEN_HEAP_GROWTH line. Off: one relaxed load at a miss of a thread's own arenas. */
+#define EDEN_HEAP_ADOPT_WIDE_MAX EDEN_HEAP_MAX_ARENAS
+static atomic_uint eden_heap_adopt_wide;
+static atomic_ullong eden_heap_adopt_wide_asks, eden_heap_adopt_wide_hits, eden_heap_adopt_wide_scans;
+static atomic_ullong eden_heap_adopt_wide_us, eden_heap_adopt_wide_max_us;
+
+void eden_heap_set_adopt_wide(unsigned arenas) {
+  if (arenas <= EDEN_HEAP_ADOPT_TRIES)
+    arenas = 0;
+  if (arenas > EDEN_HEAP_ADOPT_WIDE_MAX)
+    arenas = EDEN_HEAP_ADOPT_WIDE_MAX;
+  atomic_store_explicit(&eden_heap_adopt_wide, arenas, memory_order_relaxed);
+}
+
+/* The wide part of one look (asks past the 16th): its asks, whether it took an arena, its time. */
+static void eden_heap_adopt_wide_note(unsigned asks, int hit, unsigned long long from_us) {
+  if (asks == 0)
+    return;
+  const unsigned long long took = (unsigned long long)sceKernelGetProcessTime() - from_us;
+  atomic_fetch_add_explicit(&eden_heap_adopt_wide_scans, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_adopt_wide_asks, asks, memory_order_relaxed);
+  if (hit)
+    atomic_fetch_add_explicit(&eden_heap_adopt_wide_hits, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_heap_adopt_wide_us, took, memory_order_relaxed);
+  unsigned long long most = atomic_load_explicit(&eden_heap_adopt_wide_max_us, memory_order_relaxed);
+  while (took > most && !atomic_compare_exchange_weak_explicit(&eden_heap_adopt_wide_max_us, &most, took,
+                                                               memory_order_relaxed, memory_order_relaxed)) {
+  }
+}
 
 /* A block from an arena no thread is using, which this thread then uses; NULL when the heap holds
  * little more than is in use, or none of the arenas asked has room. The owner of an arena taken
@@ -1354,11 +2096,19 @@ static void *eden_heap_adopt(struct eden_heap_thread *self, size_t count, size_t
     }
   const unsigned arenas = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
   const unsigned start = atomic_fetch_add_explicit(&eden_heap_adopt_next, EDEN_HEAP_ADOPT_TRIES, memory_order_relaxed);
+  /* EDEN_UP_HEAP_ADOPT_WIDE: past the first 16 asks, up to its n (0: off, 16 as before). */
+  const unsigned wide = atomic_load_explicit(&eden_heap_adopt_wide, memory_order_relaxed);
+  const unsigned tries = wide != 0 ? wide : EDEN_HEAP_ADOPT_TRIES;
+  unsigned long long wide_from = 0;
   unsigned asked = 0;
-  for (unsigned i = 0; i < arenas && asked < EDEN_HEAP_ADOPT_TRIES; ++i) {
+  for (unsigned i = 0; i < arenas && asked < tries; ++i) {
+    if (asked == EDEN_HEAP_ADOPT_TRIES && wide_from == 0)
+      wide_from = (unsigned long long)sceKernelGetProcessTime() | 1u;
     void *other = eden_heap_arena_list[(start + i) % arenas];
     if (other == NULL || eden_heap_is_spare(other))
       continue; /* a spare goes whole to the next thread that needs an arena */
+    if (eden_heap_is_long_lived(other))
+      continue; /* RADV_PS5_LONGLIVED_ARENA: kept objects only (off: one load) */
     unsigned at = 0;
     while (at < busy_count && busy[at] != other)
       ++at;
@@ -1373,9 +2123,13 @@ static void *eden_heap_adopt(struct eden_heap_thread *self, size_t count, size_t
     if (address != NULL) {
       eden_heap_use_arena(self, other);
       atomic_fetch_add_explicit(&eden_heap_adopted, 1, memory_order_relaxed);
+      if (wide_from != 0)
+        eden_heap_adopt_wide_note(asked - EDEN_HEAP_ADOPT_TRIES, 1, wide_from);
       return address;
     }
   }
+  if (wide_from != 0)
+    eden_heap_adopt_wide_note(asked - EDEN_HEAP_ADOPT_TRIES, 0, wide_from);
   atomic_fetch_add_explicit(&eden_heap_adopt_misses, 1, memory_order_relaxed);
   return NULL;
 }
@@ -1723,6 +2477,1164 @@ void eden_heap_sites_report(void) {
   }
 }
 
+/* ---- EDEN_UP_BIG_STACKS=1 (0593 up big stacks, our own; log only, off unless exactly 1) ----
+ * An exact table of every heap request of 256 KiB or more, by call chain + thread name + "inside a
+ * run-time pipeline build" (T136's build scope, EDEN_UP_BUILD_BURST_LOG=1): calls, bytes asked,
+ * frees, live now, peak live, heap pieces the requests made the heap take, refusals. A reporter
+ * thread (BigStacks, detached, own 256 KiB stack, started in headless/heap_pages.cpp) prints it to
+ * stderr.log when a wave starts, every 2 s while the pool is short and every 20 s; the crash report
+ * prints its top rows (eden_big_crash_rows); operator new's EDEN_NEW_WAIT start / EDEN_HEAP_FAILURE
+ * lines get the refused request's row and the threads that grew the heap (eden_big_failure_text).
+ *
+ * Off (unset or anything but "1"): nothing is mapped, no thread runs; a request or free of
+ * 256 KiB or more pays one relaxed load of eden_big_on and a branch, smaller ones the size compare.
+ *
+ * The chain (eden_big_collect; no _Unwind_Backtrace: it can lock and allocate). CMake asks for no
+ * frame pointers, but the SIE target keeps them by default: in T136's llvm-pie.elf 83 % of Eden's C++
+ * functions and 73 % of Mesa's (RADV, NIR, ACO) begin with push rbp; mov rsp, rbp, operator new and
+ * ralloc too (leaf functions and some libraries do not). So two lists per row: the frame-pointer
+ * chain from the wrapper's caller up (exact; a function without a frame pointer is skipped or ends
+ * it), its first EDEN_BIG_KEY links the key; and, as the site tracker above, the stack scan's first
+ * code words (every return address, stale words too; tools/symbolize-big-stacks.py drops those that
+ * do not follow a call). Both read only from the frame up to the end of its page (16 KiB on the
+ * console), or, on a thread that named itself (its stack bounds taken then, outside any allocation,
+ * by pthread_attr_get_np), up to its stack's top: the scan never more than EDEN_BIG_SCAN_WORDS
+ * words, the chain never more than EDEN_BIG_FP_STEPS links.
+ *
+ * The hooks run after the allocator returned (or before a free releases the block), so none of
+ * the heap's own locks (creation, growth, mspace) is held; the caller's own locks may be, and the
+ * hooks take none: atomics on fixed tables, at most 64 + 16 probes, one bounded stack scan and one
+ * bounded chain walk, no allocation, no stdio, no sleep; besides the heap's own pthread_getspecific
+ * (eden_heap_self) only pthread_self, which takes no lock. A thread inside a hook that comes back in
+ * (a signal handler that allocates) is not followed (reentry, counted). */
+#include <time.h>
+#if defined(PS5_NATIVE)
+#include <pthread_np.h>
+#endif
+#ifndef EDEN_BIG_ROWS /* the host checks make them small to fill them */
+#define EDEN_BIG_ROWS 4096u
+#endif
+#ifndef EDEN_BIG_BLOCKS
+#define EDEN_BIG_BLOCKS 32768u
+#endif
+#define EDEN_BIG_CHAIN 16u       /* the frame-pointer chain: */
+#define EDEN_BIG_CHAIN_FIRST 12u /* its first 12 links and its outermost 4 */
+#define EDEN_BIG_SCAN 16u        /* the stack scan's first code words */
+#define EDEN_BIG_FP_STEPS 256u
+#define EDEN_BIG_PCS (EDEN_BIG_CHAIN + EDEN_BIG_SCAN)
+#define EDEN_BIG_KEY 6u
+#define EDEN_BIG_SCAN_WORDS 4096u /* 32 KiB of stack at most */
+/* The page that holds a frame is mapped whole: 16 KiB on the console; 4 KiB assumed elsewhere. */
+#if defined(PS5_NATIVE)
+#define EDEN_BIG_PAGE_MASK ((uintptr_t)0x3FFF)
+#else
+#define EDEN_BIG_PAGE_MASK ((uintptr_t)0xFFF)
+#endif
+#define EDEN_BIG_ROW_PROBES 64u
+#define EDEN_BIG_BLOCK_PROBES 16u
+#define EDEN_BIG_RISE 12u   /* rows by growth: live at the window's peak minus live at the last table */
+#define EDEN_BIG_TOP 6u     /* rows by live at the window's peak (old boot holders too) */
+#define EDEN_BIG_RECENT 6u  /* rows by bytes asked since the last table */
+#define EDEN_BIG_REFUSED 8u /* rows with new refusals */
+#define EDEN_BIG_SAID_NAMES 64u /* distinct thread names (with ok) the bounds lines name */
+/* depth: chain links kept | scan words << 8 | deep << 16 | the walk's links in the app's code << 17
+ * (more than EDEN_BIG_CHAIN: links between the first 12 and the outermost 4 were left out). */
+#define EDEN_BIG_DEPTH_TOTAL(depth) (((depth) >> 17) & 0x1FFu)
+
+struct eden_big_row {
+  _Atomic uint64_t hash; /* 0: free */
+  atomic_uint ready;     /* key written (pcs, thread, build) */
+  atomic_uint upgrading; /* a deeper chain is being written */
+  atomic_uint depth;     /* chain count | scan count << 8 | deep << 16 */
+  unsigned build;
+  unsigned key_at;       /* 0: keyed on the chain; EDEN_BIG_CHAIN: on the scan */
+  char thread[16];
+  _Atomic uintptr_t pcs[EDEN_BIG_PCS];
+  atomic_ullong calls, bytes, frees, freed, refused, refused_last, grew;
+  atomic_llong live, blocks, peak;
+  /* The reporter's alone. */
+  unsigned long long last_calls, last_bytes, last_frees, last_grew, last_refused;
+  long long at_peak, last_live;
+};
+struct eden_big_block {
+  _Atomic uintptr_t address; /* 0 free, 1 given back */
+  atomic_uint row;
+  atomic_uint born_s;
+  atomic_ullong size;
+};
+/* Per heap record (indexed like eden_heap_threads). */
+struct eden_big_thread {
+  _Atomic uintptr_t owner; /* pthread_self() of the thread whose stack bounds these are; 0: none */
+  _Atomic uintptr_t low, high;
+  atomic_uint busy;        /* inside a hook */
+  atomic_uint refused_row; /* 1 + the row of this thread's last refused request, 0: it got none */
+  atomic_ullong refused_bytes; /* the size of this thread's last refused request of 256 KiB or more */
+  atomic_uint grown_mark[2];
+  /* eden_big_note_stack's result, for the reporter's bounds line: `noted` counts the namings. */
+  atomic_uint noted, bounds_ok, bounds_kib, bounds_why;
+};
+struct eden_big_tables {
+  struct eden_big_row rows[EDEN_BIG_ROWS];
+  struct eden_big_block blocks[EDEN_BIG_BLOCKS];
+  struct eden_big_thread threads[EDEN_HEAP_THREADS];
+  /* The reporter's alone: blocks older than 10 s per row, and its picking keys. */
+  unsigned scratch[EDEN_BIG_ROWS];
+  long long key_rise[EDEN_BIG_ROWS], key_peak[EDEN_BIG_ROWS], key_recent[EDEN_BIG_ROWS], key_refused[EDEN_BIG_ROWS];
+  unsigned char taken[EDEN_BIG_ROWS];
+  /* The crash handler's alone: live bytes per row in blocks under 10 s old. */
+  long long crash_young[EDEN_BIG_ROWS];
+};
+static struct eden_big_tables *eden_big_tables;
+static size_t eden_big_tables_size;
+static atomic_uint eden_big_on;
+static atomic_llong eden_big_class_live, eden_big_window_peak;
+static atomic_ullong eden_big_window_peak_ms, eden_big_untracked, eden_big_rows_full, eden_big_reentry,
+    eden_big_no_record, eden_big_refusals, eden_big_deep, eden_big_shallow, eden_big_rows_used;
+static atomic_uint eden_big_now_s, eden_big_mark_at;
+static atomic_ullong eden_big_now_ms, eden_big_mark_ms[2]; /* the reporter's clock, every 250 ms */
+static unsigned eden_big_build_bit;
+unsigned long long eden_free_memory_bytes(void) __attribute__((weak));
+
+static unsigned long long eden_big_steady_ms(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (unsigned long long)now.tv_sec * 1000ull + (unsigned long long)now.tv_nsec / 1000000ull;
+}
+
+/* This thread's heap pieces grown so far (0: no record). */
+static long long eden_big_grown_now(void) {
+  struct eden_heap_thread *self = eden_heap_self();
+  return self != NULL ? (long long)__atomic_load_n(&self->grown, __ATOMIC_RELAXED) : 0;
+}
+
+/* -1: not followed (off, or a request under 256 KiB); else this thread's heap pieces grown so far. */
+static inline long long eden_big_begin(size_t bytes) {
+  /* acquire: the tables' pointer, written before eden_big_on, is then seen (a plain load on x86). */
+  if (bytes < EDEN_HEAP_SMALL_REQUEST || !atomic_load_explicit(&eden_big_on, memory_order_acquire))
+    return -1;
+  return eden_big_grown_now();
+}
+
+/* The chain of the calling thread (see the comment above), in pcs[0, EDEN_BIG_CHAIN): the
+ * frame-pointer chain from the wrapper's caller up, exact where every frame keeps a frame pointer
+ * (the first EDEN_BIG_CHAIN_FIRST links and the outermost EDEN_BIG_CHAIN - EDEN_BIG_CHAIN_FIRST);
+ * in pcs[EDEN_BIG_CHAIN, EDEN_BIG_PCS): the stack scan's first code words, from the slot that holds
+ * `skip` (the hook's return address into the wrapper: below it lie the hooks' own frames, with
+ * stale words of the allocation that just ran) up, so a frame without a frame pointer is not
+ * missed, stale words included. Both read only [frame, end): the frame's page, or a named thread's
+ * stack up to its top; a link that leaves that range, goes down or is misaligned ends the chain.
+ * Returns chain count | scan count << 8 | deep << 16 | the walk's links in the app's code << 17. */
+static __attribute__((noinline, no_sanitize("address"))) unsigned
+eden_big_collect(uintptr_t pcs[EDEN_BIG_PCS], uintptr_t skip, size_t size, unsigned record) {
+  /* The code: .text and what follows it in the same executable segment up to the next 16 KiB page
+   * (operator new lives in __lcxx_override, right after .text). Only compared, never read. */
+  const uintptr_t low = (uintptr_t)__eden_text_start + 8,
+                  high = ((uintptr_t)__eden_text_end + 0x3FFFu) & ~(uintptr_t)0x3FFF;
+  const uintptr_t self = (uintptr_t)__builtin_return_address(0);
+  const uintptr_t *stack = (const uintptr_t *)__builtin_frame_address(0);
+  const uintptr_t at = (uintptr_t)stack;
+  uintptr_t end = (at | EDEN_BIG_PAGE_MASK) + 1; /* the frame's page */
+  unsigned deep = 0;
+  if (record < EDEN_HEAP_THREADS) {
+    const struct eden_big_thread *t = &eden_big_tables->threads[record];
+    const uintptr_t top = atomic_load_explicit(&t->high, memory_order_relaxed);
+    if (atomic_load_explicit(&t->owner, memory_order_acquire) == (uintptr_t)pthread_self() &&
+        at >= atomic_load_explicit(&t->low, memory_order_relaxed) && at < top) {
+      end = top & ~(uintptr_t)7;
+      deep = 1;
+    }
+  }
+  /* The stack scan. */
+  unsigned words = (unsigned)((end - at) / sizeof(uintptr_t));
+  if (words > EDEN_BIG_SCAN_WORDS)
+    words = EDEN_BIG_SCAN_WORDS;
+  unsigned from = 0;
+  for (unsigned i = 0; i < words; ++i)
+    if (stack[i] == skip) {
+      from = i + 1;
+      break;
+    }
+  uintptr_t scan[EDEN_BIG_SCAN] = {0}, chain[EDEN_BIG_CHAIN] = {0};
+  unsigned scan_n = 0;
+  uintptr_t last = 0;
+  for (unsigned i = from; i < words && scan_n < EDEN_BIG_SCAN; ++i) {
+    const uintptr_t value = stack[i];
+    if (value < low || value >= high || value == last || value == self || value == skip || value == size)
+      continue;
+    last = value;
+    scan[scan_n++] = value;
+  }
+  /* The frame-pointer chain: records [saved frame pointer, return address], from this frame up;
+   * the links up to the one that returns into the wrapper are the hooks'. */
+  const unsigned outer_room = EDEN_BIG_CHAIN - EDEN_BIG_CHAIN_FIRST;
+  uintptr_t outer[EDEN_BIG_CHAIN - EDEN_BIG_CHAIN_FIRST] = {0};
+  unsigned first_n = 0, outer_n = 0, past_skip = 0;
+  uintptr_t frame = at;
+  for (unsigned steps = 0; steps < EDEN_BIG_FP_STEPS; ++steps) {
+    if ((frame & 7u) != 0 || frame < at || frame > end - 2 * sizeof(uintptr_t))
+      break;
+    const uintptr_t next = ((const uintptr_t *)frame)[0], ret = ((const uintptr_t *)frame)[1];
+    if (!past_skip) {
+      past_skip = ret == skip;
+    } else if (ret >= low && ret < high) {
+      if (first_n < EDEN_BIG_CHAIN_FIRST)
+        chain[first_n++] = ret;
+      else
+        outer[outer_n++ % outer_room] = ret;
+    } /* else a return into code outside the app's (a system library): not listed, the walk goes on */
+    if (next <= frame)
+      break;
+    frame = next;
+  }
+  const unsigned kept = outer_n < outer_room ? outer_n : outer_room;
+  for (unsigned i = 0; i < kept; ++i)
+    chain[first_n + i] = outer[(outer_n - kept + i) % outer_room];
+  for (unsigned i = 0; i < EDEN_BIG_CHAIN; ++i)
+    pcs[i] = chain[i];
+  for (unsigned i = 0; i < EDEN_BIG_SCAN; ++i)
+    pcs[EDEN_BIG_CHAIN + i] = scan[i];
+  const unsigned total = first_n + outer_n; /* at most EDEN_BIG_FP_STEPS: 9 bits */
+  return (first_n + kept) | scan_n << 8 | deep << 16 | total << 17;
+}
+
+/* The row of a chain on this thread (made on first sight), or NULL when 64 probes find none. The
+ * key: the first EDEN_BIG_KEY links of the frame-pointer chain (exact), or, when it has none, the
+ * scan's first EDEN_BIG_KEY words; + the thread's name + the build bit. */
+static struct eden_big_row *eden_big_row_for(const uintptr_t pcs[EDEN_BIG_PCS], unsigned depth,
+                                             const char name[16], unsigned build) {
+  const unsigned key_at = (depth & 0xFFu) != 0 ? 0 : EDEN_BIG_CHAIN;
+  uint64_t hash = 0xCBF29CE484222325ull ^ key_at;
+  for (unsigned i = 0; i < EDEN_BIG_KEY; ++i)
+    hash = (hash ^ pcs[key_at + i]) * 0x100000001B3ull;
+  for (unsigned i = 0; i < 16 && name[i]; ++i)
+    hash = (hash ^ (uint8_t)name[i]) * 0x100000001B3ull;
+  hash = ((hash ^ build) * 0x100000001B3ull) | 1;
+  struct eden_big_row *rows = eden_big_tables->rows;
+  for (unsigned probe = 0; probe < EDEN_BIG_ROW_PROBES; ++probe) {
+    struct eden_big_row *row = &rows[(unsigned)((hash >> 12) + probe) % EDEN_BIG_ROWS];
+    uint64_t expected = 0;
+    if (atomic_compare_exchange_strong_explicit(&row->hash, &expected, hash, memory_order_acq_rel,
+                                                memory_order_acquire)) {
+      for (unsigned i = 0; i < EDEN_BIG_PCS; ++i)
+        atomic_store_explicit(&row->pcs[i], pcs[i], memory_order_relaxed);
+      memcpy(row->thread, name, 16);
+      row->build = build;
+      row->key_at = key_at;
+      atomic_store_explicit(&row->depth, depth, memory_order_relaxed);
+      atomic_store_explicit(&row->ready, 1, memory_order_release);
+      atomic_fetch_add_explicit(&eden_big_rows_used, 1, memory_order_relaxed);
+      return row;
+    }
+    if (expected != hash)
+      continue;
+    /* Same hash: the same key unless a collision (checked once the key is written; a row being
+     * made right now is taken as it is). */
+    if (!atomic_load_explicit(&row->ready, memory_order_acquire))
+      return row;
+    int same = row->build == build && row->key_at == key_at && memcmp(row->thread, name, 16) == 0;
+    for (unsigned i = 0; same && i < EDEN_BIG_KEY; ++i)
+      same = atomic_load_explicit(&row->pcs[key_at + i], memory_order_relaxed) == pcs[key_at + i];
+    if (!same)
+      continue;
+    /* A row keeps the deepest chain one of its calls saw (a call near a page's end sees little). */
+    const unsigned had = atomic_load_explicit(&row->depth, memory_order_relaxed);
+    if ((depth & 0xFFu) + ((depth >> 8) & 0xFFu) > (had & 0xFFu) + ((had >> 8) & 0xFFu)) {
+      unsigned free_flag = 0;
+      if (atomic_compare_exchange_strong_explicit(&row->upgrading, &free_flag, 1, memory_order_acquire,
+                                                  memory_order_relaxed)) {
+        for (unsigned i = 0; i < EDEN_BIG_PCS; ++i)
+          if (i < key_at || i >= key_at + EDEN_BIG_KEY)
+            atomic_store_explicit(&row->pcs[i], pcs[i], memory_order_relaxed);
+        atomic_store_explicit(&row->depth, depth, memory_order_relaxed);
+        atomic_store_explicit(&row->upgrading, 0, memory_order_release);
+      }
+    }
+    return row;
+  }
+  atomic_fetch_add_explicit(&eden_big_rows_full, 1, memory_order_relaxed);
+  return NULL;
+}
+
+/* A high-water mark, bounded: under heavy contention a peak may come out a little low. */
+static void eden_big_max(atomic_llong *peak, long long value) {
+  long long seen = atomic_load_explicit(peak, memory_order_relaxed);
+  for (unsigned tries = 0; value > seen && tries < 16; ++tries)
+    if (atomic_compare_exchange_weak_explicit(peak, &seen, value, memory_order_relaxed, memory_order_relaxed))
+      return;
+}
+
+/* Shared by the allocation and the refusal hooks: guard, record, chain, row. */
+static struct eden_big_row *eden_big_capture(uintptr_t skip, size_t size, struct eden_heap_thread **record) {
+  struct eden_heap_thread *self = eden_heap_self();
+  *record = self;
+  if (self == NULL) {
+    atomic_fetch_add_explicit(&eden_big_no_record, 1, memory_order_relaxed);
+    return NULL;
+  }
+  const unsigned index = (unsigned)(self - eden_heap_threads);
+  struct eden_big_thread *t = &eden_big_tables->threads[index];
+  if (atomic_exchange_explicit(&t->busy, 1, memory_order_acquire) != 0) {
+    atomic_fetch_add_explicit(&eden_big_reentry, 1, memory_order_relaxed);
+    return NULL; /* *record stays: a refusal still clears the thread's refused row */
+  }
+  uintptr_t pcs[EDEN_BIG_PCS] = {0}; /* on the stack the scan reads: no stale words here */
+  const unsigned depth = eden_big_collect(pcs, skip, size, index);
+  atomic_fetch_add_explicit(((depth >> 16) & 1u) ? &eden_big_deep : &eden_big_shallow, 1, memory_order_relaxed);
+  char name[16];
+  for (unsigned i = 0; i < 16; ++i)
+    name[i] = __atomic_load_n(&self->name[i], __ATOMIC_RELAXED);
+  name[15] = 0;
+  for (unsigned i = 0; i < 16; ++i)
+    if (name[i] == 0) {
+      memset(name + i, 0, 16 - i);
+      break;
+    }
+  /* T136's build scope (only moves with EDEN_UP_BUILD_BURST_LOG=1): its own thread writes depth. */
+  const unsigned build = eden_build_heap_records[index].depth > 0;
+  struct eden_big_row *row = eden_big_row_for(pcs, depth, name, build);
+  atomic_store_explicit(&t->busy, 0, memory_order_release);
+  return row;
+}
+
+static __attribute__((noinline)) void eden_big_note_alloc(const void *address, size_t size, long long grown_before) {
+  struct eden_heap_thread *self;
+  struct eden_big_row *row = eden_big_capture((uintptr_t)__builtin_return_address(0), size, &self);
+  if (row == NULL) {
+    atomic_fetch_add_explicit(&eden_big_untracked, size, memory_order_relaxed);
+    return;
+  }
+  const unsigned grown_now = __atomic_load_n(&self->grown, __ATOMIC_RELAXED);
+  if ((long long)grown_now > grown_before)
+    atomic_fetch_add_explicit(&row->grew, (unsigned long long)((long long)grown_now - grown_before), memory_order_relaxed);
+  atomic_fetch_add_explicit(&row->calls, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&row->bytes, size, memory_order_relaxed);
+  /* The block's place first: one that finds none is counted as untracked, not as live. */
+  const uintptr_t value = (uintptr_t)address;
+  const unsigned first = (unsigned)(((value >> 4) * 0x9E3779B97F4A7C15ull) >> 40) % EDEN_BIG_BLOCKS;
+  for (unsigned probe = 0; probe < EDEN_BIG_BLOCK_PROBES; ++probe) {
+    struct eden_big_block *block = &eden_big_tables->blocks[(first + probe) % EDEN_BIG_BLOCKS];
+    uintptr_t seen = atomic_load_explicit(&block->address, memory_order_relaxed);
+    if (seen > 1)
+      continue;
+    if (!atomic_compare_exchange_strong_explicit(&block->address, &seen, value, memory_order_acq_rel,
+                                                 memory_order_relaxed))
+      continue;
+    atomic_store_explicit(&block->row, (unsigned)(row - eden_big_tables->rows), memory_order_relaxed);
+    atomic_store_explicit(&block->size, size, memory_order_relaxed);
+    atomic_store_explicit(&block->born_s, atomic_load_explicit(&eden_big_now_s, memory_order_relaxed),
+                          memory_order_relaxed);
+    eden_big_max(&row->peak, atomic_fetch_add_explicit(&row->live, (long long)size, memory_order_relaxed) + (long long)size);
+    atomic_fetch_add_explicit(&row->blocks, 1, memory_order_relaxed);
+    const long long class_live =
+        atomic_fetch_add_explicit(&eden_big_class_live, (long long)size, memory_order_relaxed) + (long long)size;
+    const long long window = atomic_load_explicit(&eden_big_window_peak, memory_order_relaxed);
+    if (class_live > window) {
+      eden_big_max(&eden_big_window_peak, class_live);
+      atomic_store_explicit(&eden_big_window_peak_ms, atomic_load_explicit(&eden_big_now_ms, memory_order_relaxed), memory_order_relaxed);
+    }
+    return;
+  }
+  atomic_fetch_add_explicit(&eden_big_untracked, size, memory_order_relaxed);
+}
+
+/* Counts attempts: operator new with EDEN_UP_NEW_WAIT_MS asks again every 20 ms, and each retry is
+ * one more refusal (and capture) on the same row. The thread's refused row and size are set on every
+ * refusal (row 0 when this one got none), so the failure lines never name an older request. */
+static __attribute__((noinline)) void eden_big_note_refused(size_t size) {
+  struct eden_heap_thread *self;
+  struct eden_big_row *row = eden_big_capture((uintptr_t)__builtin_return_address(0), size, &self);
+  atomic_fetch_add_explicit(&eden_big_refusals, 1, memory_order_relaxed);
+  if (self != NULL) {
+    struct eden_big_thread *t = &eden_big_tables->threads[self - eden_heap_threads];
+    atomic_store_explicit(&t->refused_bytes, size, memory_order_relaxed);
+    atomic_store_explicit(&t->refused_row, row != NULL ? (unsigned)(row - eden_big_tables->rows) + 1 : 0u,
+                          memory_order_relaxed);
+  }
+  if (row == NULL)
+    return;
+  atomic_fetch_add_explicit(&row->refused, 1, memory_order_relaxed);
+  atomic_store_explicit(&row->refused_last, size, memory_order_relaxed);
+}
+
+/* The wrappers' end of a followed request: `grown_before` from eden_big_begin (-1: not followed). */
+static inline void eden_big_end(const void *address, size_t size, long long grown_before) {
+  if (grown_before < 0)
+    return;
+  if (address != NULL)
+    eden_big_note_alloc(address, size, grown_before);
+  else
+    eden_big_note_refused(size);
+}
+
+/* A followed block leaves the table before its memory goes back (so its address cannot be handed
+ * out again meanwhile). Returns 1 + the row, with *size, or 0 when the block is not followed. */
+static unsigned eden_big_detach(const void *address, unsigned long long *size) {
+  const uintptr_t value = (uintptr_t)address;
+  const unsigned first = (unsigned)(((value >> 4) * 0x9E3779B97F4A7C15ull) >> 40) % EDEN_BIG_BLOCKS;
+  for (unsigned probe = 0; probe < EDEN_BIG_BLOCK_PROBES; ++probe) {
+    struct eden_big_block *block = &eden_big_tables->blocks[(first + probe) % EDEN_BIG_BLOCKS];
+    uintptr_t seen = atomic_load_explicit(&block->address, memory_order_acquire);
+    if (seen == 0)
+      return 0;
+    if (seen != value)
+      continue;
+    const unsigned row = atomic_load_explicit(&block->row, memory_order_relaxed);
+    const unsigned long long bytes = atomic_load_explicit(&block->size, memory_order_relaxed);
+    if (!atomic_compare_exchange_strong_explicit(&block->address, &seen, 1, memory_order_acq_rel, memory_order_relaxed))
+      return 0;
+    struct eden_big_row *r = &eden_big_tables->rows[row % EDEN_BIG_ROWS];
+    atomic_fetch_sub_explicit(&r->live, (long long)bytes, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&r->blocks, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&r->frees, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&r->freed, bytes, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_big_class_live, (long long)bytes, memory_order_relaxed);
+    *size = bytes;
+    return row + 1;
+  }
+  return 0;
+}
+
+/* realloc's old block, back in its row when the realloc failed and the block stays. */
+static void eden_big_reattach(const void *address, unsigned row, unsigned long long size) {
+  struct eden_big_row *r = &eden_big_tables->rows[(row - 1) % EDEN_BIG_ROWS];
+  const uintptr_t value = (uintptr_t)address;
+  const unsigned first = (unsigned)(((value >> 4) * 0x9E3779B97F4A7C15ull) >> 40) % EDEN_BIG_BLOCKS;
+  atomic_fetch_sub_explicit(&r->frees, 1, memory_order_relaxed);
+  atomic_fetch_sub_explicit(&r->freed, size, memory_order_relaxed);
+  for (unsigned probe = 0; probe < EDEN_BIG_BLOCK_PROBES; ++probe) {
+    struct eden_big_block *block = &eden_big_tables->blocks[(first + probe) % EDEN_BIG_BLOCKS];
+    uintptr_t seen = atomic_load_explicit(&block->address, memory_order_relaxed);
+    if (seen > 1 ||
+        !atomic_compare_exchange_strong_explicit(&block->address, &seen, value, memory_order_acq_rel, memory_order_relaxed))
+      continue;
+    atomic_store_explicit(&block->row, row - 1, memory_order_relaxed);
+    atomic_store_explicit(&block->size, size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&r->live, (long long)size, memory_order_relaxed);
+    atomic_fetch_add_explicit(&r->blocks, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_big_class_live, (long long)size, memory_order_relaxed);
+    return;
+  }
+  atomic_fetch_add_explicit(&eden_big_untracked, size, memory_order_relaxed);
+}
+
+static inline void eden_big_free(const void *address, size_t usable) {
+  if (usable < EDEN_HEAP_SMALL_REQUEST || !atomic_load_explicit(&eden_big_on, memory_order_acquire))
+    return;
+  unsigned long long size;
+  (void)eden_big_detach(address, &size);
+}
+
+/* EDEN_UP_BIG_STACKS: a thread that names itself (eden_heap_name_thread, outside any allocation)
+ * keeps its stack's bounds, so the scan may read past the frame's page up to the stack's top. A
+ * fiber's frame lies outside them and reads only its page.
+ *
+ * The bounds are trusted only when the kernel says that [the page of this call's frame, top) is
+ * mapped and readable (review M1: pthread_attr_get_np could name a wrong top, and a garbage
+ * frame-pointer link would then read past the stack, a fault inside malloc). The kept low is the
+ * start of the readable range that holds this frame, so every deep read [frame, top) of a frame
+ * inside [low, top) lies in memory the kernel called readable. The stack lives as long as its
+ * thread; eden_big_thread_ended clears the bounds before the record is given back.
+ * Returns 1 and the readable [*from, *to) around [at, top), or 0. At most 64 kernel regions. The host
+ * stand-in (Linux, mincore) checks the whole [low, top), else [the frame's page, top): mincore says
+ * mapped, not readable, and glibc's pthread_getattr_np leaves the guard page out of [low, top). */
+#if defined(PS5_NATIVE)
+int32_t sceKernelQueryMemoryProtection(void *address, void **start, void **end, uint32_t *protection);
+#define EDEN_BIG_PROT_CPU_READ 0x01u /* as RADV's 0x33 mask (CPU read|write, GPU read|write) */
+#elif defined(__linux__)
+#include <sys/mman.h>
+#endif
+static int eden_big_readable(uintptr_t low, uintptr_t at, uintptr_t top, uintptr_t *from, uintptr_t *to) {
+  const uintptr_t page = EDEN_BIG_PAGE_MASK + 1;
+  const uintptr_t first = at & ~EDEN_BIG_PAGE_MASK;
+  if (top <= first)
+    return 0;
+#if defined(PS5_NATIVE)
+  (void)low;
+  (void)page;
+  uintptr_t cursor = first, start_low = 0;
+  for (unsigned regions = 0; regions < 64u; ++regions) {
+    void *start = NULL, *end = NULL;
+    uint32_t protection = 0;
+    if (sceKernelQueryMemoryProtection((void *)cursor, &start, &end, &protection) != 0 ||
+        (uintptr_t)start > cursor || (uintptr_t)end <= cursor || !(protection & EDEN_BIG_PROT_CPU_READ))
+      return 0;
+    if (regions == 0)
+      start_low = (uintptr_t)start;
+    cursor = (uintptr_t)end;
+    if (cursor >= top) {
+      *from = start_low;
+      *to = top;
+      return 1;
+    }
+  }
+  return 0;
+#elif defined(__linux__)
+  /* The host checks: mincore fails with ENOMEM on any page that is not mapped (stacks are read/write). */
+  /* [low, top) whole, else (a main thread's stack, mapped as it grows) [the frame's page, top). */
+  unsigned char state[256];
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    const uintptr_t begin = attempt == 0 ? low : first;
+    if ((begin & EDEN_BIG_PAGE_MASK) != 0 || begin > first)
+      continue;
+    uintptr_t cursor = begin;
+    while (cursor < top) {
+      const uintptr_t pages = (top - cursor + page - 1) / page;
+      const size_t now = pages < 256u ? (size_t)pages : 256u;
+      if (mincore((void *)cursor, now * page, state) != 0)
+        break;
+      cursor += now * page;
+    }
+    if (cursor >= top) {
+      *from = begin;
+      *to = top;
+      return 1;
+    }
+  }
+  return 0;
+#else
+  (void)page;
+  (void)low;
+  (void)from;
+  (void)to;
+  return 0; /* no way to check here: shallow */
+#endif
+}
+
+static struct eden_big_tables *eden_big_tables_now(void) {
+  return __atomic_load_n(&eden_big_tables, __ATOMIC_ACQUIRE);
+}
+
+static void eden_big_note_stack(struct eden_heap_thread *self) {
+  struct eden_big_tables *tables = eden_big_tables_now();
+  if (tables == NULL || self == NULL)
+    return;
+  struct eden_big_thread *t = &tables->threads[self - eden_heap_threads];
+  uintptr_t low = 0, high = 0;
+#if defined(PS5_NATIVE) || defined(__FreeBSD__)
+  pthread_attr_t attributes;
+  if (pthread_attr_init(&attributes) == 0) {
+    void *base = NULL;
+    size_t bytes = 0;
+    if (pthread_attr_get_np(pthread_self(), &attributes) == 0 && pthread_attr_getstack(&attributes, &base, &bytes) == 0) {
+      low = (uintptr_t)base;
+      high = low + bytes;
+    }
+    pthread_attr_destroy(&attributes);
+  }
+#elif defined(__APPLE__)
+  high = (uintptr_t)pthread_get_stackaddr_np(pthread_self());
+  low = high - pthread_get_stacksize_np(pthread_self());
+#elif defined(__linux__)
+  pthread_attr_t attributes;
+  if (pthread_getattr_np(pthread_self(), &attributes) == 0) {
+    void *base = NULL;
+    size_t bytes = 0;
+    if (pthread_attr_getstack(&attributes, &base, &bytes) == 0) {
+      low = (uintptr_t)base;
+      high = low + bytes;
+    }
+    pthread_attr_destroy(&attributes);
+  }
+#endif
+  /* The frame of this call must lie inside, or the bounds are not this stack's. */
+  const uintptr_t here = (uintptr_t)__builtin_frame_address(0);
+  atomic_store_explicit(&t->owner, 0, memory_order_release);
+  unsigned why = 0; /* 0 ok, 1 no bounds, 2 this frame outside or too large, 3 the kernel check */
+  uintptr_t from = 0, to = 0;
+  if (low == 0 || high <= low)
+    why = 1;
+  else if (here < low || here >= high || high - low > ((size_t)256 << 20))
+    why = 2;
+  else if (!eden_big_readable(low, here, high, &from, &to))
+    why = 3;
+  if (why == 0) {
+    if (from > low)
+      low = from;
+    if (to < high)
+      high = to;
+    atomic_store_explicit(&t->low, low, memory_order_relaxed);
+    atomic_store_explicit(&t->high, high, memory_order_relaxed);
+    atomic_store_explicit(&t->owner, (uintptr_t)pthread_self(), memory_order_release);
+  }
+  atomic_store_explicit(&t->bounds_ok, why == 0, memory_order_relaxed);
+  atomic_store_explicit(&t->bounds_why, why, memory_order_relaxed);
+  atomic_store_explicit(&t->bounds_kib, why == 0 ? (unsigned)((high - low) >> 10) : 0u, memory_order_relaxed);
+  atomic_fetch_add_explicit(&t->noted, 1, memory_order_release);
+}
+
+/* A record's thread ends: its bounds go (eden_heap_thread_exit). */
+static void eden_big_thread_ended(struct eden_heap_thread *self) {
+  struct eden_big_tables *tables = eden_big_tables_now();
+  if (tables != NULL && self != NULL)
+    atomic_store_explicit(&tables->threads[self - eden_heap_threads].owner, 0, memory_order_release);
+}
+
+/* EDEN_UP_BIG_STACKS, from eden_heap_pool_init: map the tables (hint 0x10_0000_0000, as the fiber
+ * stacks: a mapping that names no address lands in RADV's 32-bit window). 0: done; else -1 with
+ * `why` (map, place) and errno in *error. Nothing is followed until eden_big_stacks_go. */
+int eden_big_stacks_map(const char **why, int *error) {
+  if (eden_big_tables != NULL)
+    return 0;
+  const size_t size = (sizeof(struct eden_big_tables) + 16383u) & ~(size_t)16383u;
+  void *at = mmap((void *)0x1000000000ull, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+  if (at == MAP_FAILED) {
+    *why = "map";
+    *error = errno;
+    return -1;
+  }
+#if defined(PS5_NATIVE)
+  if ((uintptr_t)at < 0x300000000ull || (uintptr_t)at + size > 0x4000000000ull) {
+    munmap(at, size);
+    *why = "place";
+    *error = 0;
+    return -1;
+  }
+#endif
+  eden_big_tables_size = size;
+  __atomic_store_n(&eden_big_tables, (struct eden_big_tables *)at, __ATOMIC_RELEASE);
+  return 0;
+}
+
+/* The reporter thread could not be made: nothing will be followed. The pointer goes, the 2.6 MiB stay
+ * mapped (review S1: a thread naming itself right now may still write its bounds into them). */
+void eden_big_stacks_unmap(void) {
+  if (atomic_load_explicit(&eden_big_on, memory_order_relaxed))
+    return;
+  __atomic_store_n(&eden_big_tables, (struct eden_big_tables *)NULL, __ATOMIC_RELEASE);
+}
+
+/* On, once the reporter thread exists. `build_bit`: EDEN_UP_BUILD_BURST_LOG=1 too (else build=0). */
+void eden_big_stacks_go(int build_bit) {
+  if (eden_big_tables == NULL)
+    return;
+  eden_big_build_bit = build_bit != 0;
+  /* The hooks' clock (blocks' age, the window peak's time) from the start, before the reporter's first tick. */
+  const unsigned long long now_ms = eden_big_steady_ms();
+  atomic_store_explicit(&eden_big_now_ms, now_ms, memory_order_relaxed);
+  atomic_store_explicit(&eden_big_now_s, (unsigned)(now_ms / 1000u), memory_order_relaxed);
+  atomic_store_explicit(&eden_big_window_peak_ms, now_ms, memory_order_relaxed);
+  fprintf(stderr,
+          "EDEN_BIG_STACKS on rows=%u blocks=%u table_at=%p table_kib=%zu code=0x%lx-0x%lx (pcs below are offsets "
+          "from code start, = addresses in llvm-pie.elf) chain=%u scan=%u key=%u scan_kib=%u build_bit=%u "
+          "steady_ms=%llu\n",
+          EDEN_BIG_ROWS, EDEN_BIG_BLOCKS, (void *)eden_big_tables, eden_big_tables_size >> 10,
+          (unsigned long)(uintptr_t)__eden_text_start, (unsigned long)(uintptr_t)__eden_text_end, EDEN_BIG_CHAIN,
+          EDEN_BIG_SCAN, EDEN_BIG_KEY, EDEN_BIG_SCAN_WORDS * 8u / 1024u, eden_big_build_bit, now_ms);
+  atomic_store_explicit(&eden_big_on, 1, memory_order_release);
+}
+
+/* ---- EDEN_UP_BIG_STACKS: the reporter thread (BigStacks), outside every hook ---- */
+static void eden_big_mib(char *out, size_t room, long long bytes) {
+  if (bytes < 0)
+    bytes = 0;
+  snprintf(out, room, "%lld.%lld", bytes >> 20, ((bytes & ((1ll << 20) - 1)) * 10) >> 20);
+}
+
+static const char *eden_big_name(const char name[16], char out[16]) {
+  unsigned i = 0;
+  for (; i < 15 && name[i]; ++i)
+    out[i] = name[i] == ' ' || name[i] == '=' || name[i] == ',' ? '_' : name[i];
+  out[i] = 0;
+  return i ? out : "?";
+}
+
+/* Chosen rows of a table, most first by `key` (bounded insertion; `taken` keeps a row once). */
+static unsigned eden_big_pick(unsigned *picked, unsigned have, unsigned most, const long long *key,
+                              unsigned char *taken) {
+  unsigned start = have;
+  if (most == 0)
+    return have;
+  for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r) {
+    if (taken[r] || key[r] <= 0)
+      continue;
+    unsigned place = have;
+    if (have - start < most)
+      ++have;
+    else if (key[r] <= key[picked[have - 1]])
+      continue;
+    else
+      place = have - 1;
+    while (place > start && key[picked[place - 1]] < key[r]) {
+      picked[place] = picked[place - 1];
+      --place;
+    }
+    picked[place] = r;
+  }
+  for (unsigned i = start; i < have; ++i)
+    taken[picked[i]] = 1;
+  return have;
+}
+
+static void eden_big_table(const char *why, unsigned seq, unsigned long long now_ms, size_t heap, size_t heap_2s,
+                           unsigned long long pool, int steady) {
+  struct eden_big_tables *tables = eden_big_tables_now();
+  const unsigned now_s = atomic_load_explicit(&eden_big_now_s, memory_order_relaxed);
+  memset(tables->scratch, 0, sizeof(tables->scratch));
+  for (unsigned b = 0; b < EDEN_BIG_BLOCKS; ++b) {
+    const struct eden_big_block *block = &tables->blocks[b];
+    if (atomic_load_explicit(&block->address, memory_order_relaxed) <= 1)
+      continue;
+    if (atomic_load_explicit(&block->born_s, memory_order_relaxed) + 10u <= now_s)
+      ++tables->scratch[atomic_load_explicit(&block->row, memory_order_relaxed) % EDEN_BIG_ROWS];
+  }
+  for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r) {
+    struct eden_big_row *row = &tables->rows[r];
+    const int used = atomic_load_explicit(&row->ready, memory_order_acquire) != 0;
+    tables->taken[r] = !used;
+    tables->key_rise[r] = used && !steady ? row->at_peak - row->last_live : 0;
+    tables->key_peak[r] = used && !steady ? row->at_peak : 0;
+    tables->key_recent[r] = used ? (long long)(atomic_load_explicit(&row->bytes, memory_order_relaxed) - row->last_bytes) : 0;
+    tables->key_refused[r] = used ? (long long)(atomic_load_explicit(&row->refused, memory_order_relaxed) - row->last_refused) : 0;
+  }
+  /* Growth first (review B: the boot's long-lived holders must not push a wave's rows out), then
+   * the largest holders, the busiest since the last table, new refusals. */
+  unsigned picked[EDEN_BIG_RISE + EDEN_BIG_TOP + EDEN_BIG_RECENT + EDEN_BIG_REFUSED];
+  unsigned count = eden_big_pick(picked, 0, steady ? 0 : EDEN_BIG_RISE, tables->key_rise, tables->taken);
+  count = eden_big_pick(picked, count, steady ? 0 : EDEN_BIG_TOP, tables->key_peak, tables->taken);
+  count = eden_big_pick(picked, count, EDEN_BIG_RECENT, tables->key_recent, tables->taken);
+  count = eden_big_pick(picked, count, EDEN_BIG_REFUSED, tables->key_refused, tables->taken);
+  char live[24], peak[24], at_heap[24], at_2s[24], untracked[24];
+  eden_big_mib(live, sizeof(live), atomic_load_explicit(&eden_big_class_live, memory_order_relaxed));
+  eden_big_mib(peak, sizeof(peak), atomic_load_explicit(&eden_big_window_peak, memory_order_relaxed));
+  eden_big_mib(at_heap, sizeof(at_heap), (long long)heap);
+  eden_big_mib(at_2s, sizeof(at_2s), (long long)heap_2s);
+  eden_big_mib(untracked, sizeof(untracked), (long long)atomic_load_explicit(&eden_big_untracked, memory_order_relaxed));
+  char pool_text[24];
+  if (pool != 0)
+    snprintf(pool_text, sizeof(pool_text), "%llu", pool >> 20);
+  else
+    snprintf(pool_text, sizeof(pool_text), "unknown");
+  fprintf(stderr,
+          "EDEN_BIG_TABLE n=%u why=%s steady_ms=%llu class_live_mib=%s win_peak_mib=%s win_peak_ms=%llu heap_mib=%s "
+          "heap_2s_mib=+%s pool_mib=%s rows=%llu rows_full=%llu untracked_mib=%s reentry=%llu no_record=%llu "
+          "refusals=%llu deep=%llu shallow=%llu shown=%u\n",
+          seq, why, now_ms, live, peak, (unsigned long long)atomic_load_explicit(&eden_big_window_peak_ms, memory_order_relaxed),
+          at_heap, at_2s, pool_text, (unsigned long long)atomic_load_explicit(&eden_big_rows_used, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_big_rows_full, memory_order_relaxed), untracked,
+          (unsigned long long)atomic_load_explicit(&eden_big_reentry, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_big_no_record, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_big_refusals, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_big_deep, memory_order_relaxed),
+          (unsigned long long)atomic_load_explicit(&eden_big_shallow, memory_order_relaxed), count);
+  const uintptr_t code = (uintptr_t)__eden_text_start;
+  for (unsigned i = 0; i < count; ++i) {
+    struct eden_big_row *row = &tables->rows[picked[i]];
+    char line[1024], name[16], at_peak[24], rise[24], now[24], high[24], asked_new[24], asked[24];
+    const unsigned long long calls = atomic_load_explicit(&row->calls, memory_order_relaxed),
+                             bytes = atomic_load_explicit(&row->bytes, memory_order_relaxed),
+                             frees = atomic_load_explicit(&row->frees, memory_order_relaxed),
+                             grew = atomic_load_explicit(&row->grew, memory_order_relaxed),
+                             refused = atomic_load_explicit(&row->refused, memory_order_relaxed);
+    const unsigned depth = atomic_load_explicit(&row->depth, memory_order_relaxed);
+    eden_big_mib(at_peak, sizeof(at_peak), row->at_peak);
+    const long long rise_bytes = row->at_peak - row->last_live;
+    eden_big_mib(rise, sizeof(rise), rise_bytes < 0 ? -rise_bytes : rise_bytes);
+    eden_big_mib(now, sizeof(now), atomic_load_explicit(&row->live, memory_order_relaxed));
+    eden_big_mib(high, sizeof(high), atomic_load_explicit(&row->peak, memory_order_relaxed));
+    eden_big_mib(asked_new, sizeof(asked_new), (long long)(bytes - row->last_bytes));
+    eden_big_mib(asked, sizeof(asked), (long long)bytes);
+    int at = snprintf(line, sizeof(line),
+                      "EDEN_BIG_STACK n=%u row=%u thread=%s build=%u at_peak_mib=%s rise_mib=%s%s live_mib=%s blocks=%lld "
+                      "peak_mib=%s calls=+%llu/%llu req_mib=+%s/%s frees=+%llu/%llu grew_mib=+%llu/%llu refused=+%llu/%llu "
+                      "last_refused=%llu old10s=%u depth=%u+%u chain_total=%u deep=%u key=%s pcs=",
+                      seq, picked[i], eden_big_name(row->thread, name), row->build, at_peak, rise_bytes < 0 ? "-" : "+",
+                      rise, now,
+                      (long long)atomic_load_explicit(&row->blocks, memory_order_relaxed), high, calls - row->last_calls,
+                      calls, asked_new, asked, frees - row->last_frees, frees,
+                      (grew - row->last_grew) << (EDEN_HEAP_PIECE_SHIFT - 20), grew << (EDEN_HEAP_PIECE_SHIFT - 20),
+                      refused - row->last_refused, refused,
+                      (unsigned long long)atomic_load_explicit(&row->refused_last, memory_order_relaxed),
+                      tables->scratch[picked[i]], depth & 0xFFu, (depth >> 8) & 0xFFu, EDEN_BIG_DEPTH_TOTAL(depth),
+                      (depth >> 16) & 1u, row->key_at == 0 ? "chain" : "scan");
+    /* ".." after the 12th chain link: links between it and the outermost 4 were left out. */
+    const int gap = EDEN_BIG_DEPTH_TOTAL(depth) > EDEN_BIG_CHAIN;
+    for (unsigned k = 0; k < EDEN_BIG_PCS && at > 0 && at < (int)sizeof(line) - 24; ++k) {
+      const uintptr_t pc = atomic_load_explicit(&row->pcs[k], memory_order_relaxed);
+      if (k == EDEN_BIG_CHAIN)
+        line[at++] = '|';
+      if (gap && k == EDEN_BIG_CHAIN_FIRST) {
+        line[at++] = ',';
+        line[at++] = '.';
+        line[at++] = '.';
+      }
+      if (pc == 0)
+        continue;
+      at += snprintf(line + at, sizeof(line) - (size_t)at, "%s%lx",
+                     k == 0 || k == EDEN_BIG_CHAIN ? "" : ",", (unsigned long)(pc - code));
+    }
+    if (at > 0 && at < (int)sizeof(line) - 1) {
+      line[at++] = '\n';
+      line[at] = 0;
+      fputs(line, stderr);
+    }
+  }
+  /* The next table counts from here. */
+  for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r) {
+    struct eden_big_row *row = &tables->rows[r];
+    if (!atomic_load_explicit(&row->ready, memory_order_acquire))
+      continue;
+    row->last_calls = atomic_load_explicit(&row->calls, memory_order_relaxed);
+    row->last_bytes = atomic_load_explicit(&row->bytes, memory_order_relaxed);
+    row->last_frees = atomic_load_explicit(&row->frees, memory_order_relaxed);
+    row->last_grew = atomic_load_explicit(&row->grew, memory_order_relaxed);
+    row->last_refused = atomic_load_explicit(&row->refused, memory_order_relaxed);
+    row->at_peak = row->last_live = atomic_load_explicit(&row->live, memory_order_relaxed); /* the next window starts here */
+  }
+  const long long class_live = atomic_load_explicit(&eden_big_class_live, memory_order_relaxed);
+  atomic_store_explicit(&eden_big_window_peak, class_live, memory_order_relaxed);
+  atomic_store_explicit(&eden_big_window_peak_ms, now_ms, memory_order_relaxed);
+}
+
+/* The reporter's loop (headless/heap_pages.cpp starts it on its own thread). Every 250 ms: the
+ * clock for the hooks, the heap's pieces, the class's live total (at a new high since the last
+ * table every row's live is copied: the class's make-up at its peak, within 250 ms), every 2 s the
+ * threads' grown pieces (for eden_big_failure_text). A table: at once when a wave starts (class
+ * live +128 MiB or heap pieces +256 MiB within 2 s), 2 s after the wave's last table (`after`), every 2 s while the pool's largest free block is under 768 MiB, else every
+ * 20 s (six rows). Returns only after eden_big_stacks_stop (host checks). */
+static atomic_uint eden_big_stop;
+/* One line per thread name and result (review M1): whether that thread's deep reads are allowed.
+ * The first EDEN_BIG_SAID_NAMES name+result pairs; the rest only counted on the last line. */
+static void eden_big_say_bounds(struct eden_big_tables *tables) {
+  static unsigned seen[EDEN_HEAP_THREADS];
+  static char said[EDEN_BIG_SAID_NAMES][16];
+  static unsigned char said_ok[EDEN_BIG_SAID_NAMES];
+  static unsigned said_n, unsaid;
+  static const char *const whys[4] = {"ok", "no_bounds", "frame_outside", "kernel_check"};
+  for (unsigned r = 0; r < EDEN_HEAP_THREADS; ++r) {
+    const struct eden_big_thread *t = &tables->threads[r];
+    const unsigned noted = atomic_load_explicit(&t->noted, memory_order_acquire);
+    if (noted == seen[r])
+      continue;
+    seen[r] = noted;
+    char name[16], clean[16];
+    for (unsigned k = 0; k < 16; ++k)
+      name[k] = __atomic_load_n(&eden_heap_threads[r].name[k], __ATOMIC_RELAXED);
+    name[15] = 0;
+    const unsigned ok = atomic_load_explicit(&t->bounds_ok, memory_order_relaxed) != 0;
+    unsigned i = 0;
+    while (i < said_n && !(said_ok[i] == ok && memcmp(said[i], name, 16) == 0))
+      ++i;
+    if (i < said_n)
+      continue;
+    if (said_n == EDEN_BIG_SAID_NAMES) {
+      ++unsaid;
+      continue;
+    }
+    memcpy(said[said_n], name, 16);
+    said_ok[said_n++] = (unsigned char)ok;
+    const unsigned why = atomic_load_explicit(&t->bounds_why, memory_order_relaxed);
+    fprintf(stderr, "EDEN_BIG_STACKS bounds thread=%s kib=%u ok=%u why=%s record=%u names=%u unsaid=%u\n",
+            eden_big_name(name, clean), atomic_load_explicit(&t->bounds_kib, memory_order_relaxed), ok,
+            whys[why & 3u], r, said_n, unsaid);
+  }
+}
+void eden_big_stacks_stop(void) { /* the host checks' end; nothing on the console calls it */
+  atomic_store_explicit(&eden_big_stop, 1, memory_order_relaxed);
+}
+void eden_big_stacks_run(void) {
+  int said = 0;
+  size_t history[8] = {0};
+  long long live_history[8] = {0};
+  unsigned ticks = 0, seq = 0;
+  unsigned long long last_table_ms = 0, last_wave_ms = 0, wave_after_ms = 0, mark_ms = 0;
+  long long live_at_table = 0, best = 0;
+  size_t heap_at_table = 0;
+  while (!atomic_load_explicit(&eden_big_stop, memory_order_relaxed)) {
+    const struct timespec quarter = {0, 250000000L};
+    nanosleep(&quarter, NULL);
+    const unsigned long long now_ms = eden_big_steady_ms();
+    atomic_store_explicit(&eden_big_now_ms, now_ms, memory_order_relaxed);
+    atomic_store_explicit(&eden_big_now_s, (unsigned)(now_ms / 1000u), memory_order_relaxed);
+    struct eden_big_tables *tables = eden_big_tables_now();
+    if (tables == NULL || !atomic_load_explicit(&eden_big_on, memory_order_acquire))
+      continue;
+    if (!said) {
+      /* Its own stack, as the hooks see a named thread's: about 256 KiB when the bounds work here. */
+      said = 1;
+      last_table_ms = now_ms; /* the first steady table 20 s from here */
+      struct eden_heap_thread *self = eden_heap_self();
+      const struct eden_big_thread *t = self != NULL ? &tables->threads[self - eden_heap_threads] : NULL;
+      const uintptr_t low = t ? atomic_load_explicit(&t->low, memory_order_relaxed) : 0,
+                      high = t ? atomic_load_explicit(&t->high, memory_order_relaxed) : 0;
+      const int bounds = t != NULL && atomic_load_explicit(&t->owner, memory_order_acquire) == (uintptr_t)pthread_self();
+      fprintf(stderr, "EDEN_BIG_STACKS reporter stack=0x%lx-0x%lx kib=%lu bounds=%d\n", (unsigned long)low,
+              (unsigned long)high, (unsigned long)((high - low) >> 10), bounds);
+    }
+    eden_big_say_bounds(tables);
+    const size_t heap = atomic_load_explicit(&eden_heap_committed_bytes, memory_order_relaxed);
+    const long long class_live = atomic_load_explicit(&eden_big_class_live, memory_order_relaxed);
+    history[ticks % 8u] = heap;
+    live_history[ticks % 8u] = class_live;
+    ++ticks;
+    size_t lowest = heap;
+    long long live_lowest = class_live;
+    for (unsigned i = 0; i < 8u; ++i) {
+      if (i < ticks && history[i] < lowest)
+        lowest = history[i];
+      if (live_history[i] < live_lowest) /* 0 before the first ticks: the class starts empty */
+        live_lowest = live_history[i];
+    }
+    const size_t heap_2s = heap - lowest;
+    if (now_ms - mark_ms >= 2000u) {
+      mark_ms = now_ms;
+      const unsigned next = atomic_load_explicit(&eden_big_mark_at, memory_order_relaxed) ^ 1u;
+      for (unsigned r = 0; r < EDEN_HEAP_THREADS; ++r)
+        atomic_store_explicit(&tables->threads[r].grown_mark[next], __atomic_load_n(&eden_heap_threads[r].grown, __ATOMIC_RELAXED),
+                              memory_order_relaxed);
+      atomic_store_explicit(&eden_big_mark_ms[next], now_ms, memory_order_relaxed);
+      atomic_store_explicit(&eden_big_mark_at, next, memory_order_release);
+    }
+    if (class_live > best) {
+      best = class_live;
+      for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r)
+        tables->rows[r].at_peak = atomic_load_explicit(&tables->rows[r].live, memory_order_relaxed);
+    }
+    const unsigned long long pool = eden_free_memory_bytes ? eden_free_memory_bytes() : 0;
+    /* A wave: the class's live total +128 MiB, or the heap's pieces +256 MiB, within 2 s. A wave
+     * table at most every 500 ms, and again within 2 s of the last only while it still rises. */
+    const int wave = class_live - live_lowest >= (128ll << 20) || heap_2s >= ((size_t)256 << 20);
+    const int rising = class_live - live_at_table >= (64ll << 20) || heap >= heap_at_table + ((size_t)64 << 20);
+    const char *why = NULL;
+    int steady = 0;
+    if (wave && now_ms - last_table_ms >= 500u && (now_ms - last_wave_ms >= 2000u || rising)) {
+      why = "wave";
+      last_wave_ms = now_ms;
+      wave_after_ms = now_ms + 2000u;
+    } else if (wave_after_ms != 0 && now_ms >= wave_after_ms) {
+      why = "after";
+      wave_after_ms = 0;
+    } else if (pool != 0 && pool < ((unsigned long long)768 << 20) && now_ms - last_table_ms >= 2000u) {
+      why = "short";
+    } else if (now_ms - last_table_ms >= 20000u) {
+      why = "steady";
+      steady = 1;
+    }
+    if (why == NULL)
+      continue;
+    eden_big_table(why, ++seq, now_ms, heap, heap_2s, pool, steady);
+    last_table_ms = now_ms;
+    live_at_table = best = atomic_load_explicit(&eden_big_class_live, memory_order_relaxed);
+    heap_at_table = atomic_load_explicit(&eden_heap_committed_bytes, memory_order_relaxed);
+  }
+}
+
+/* ---- EDEN_UP_BIG_STACKS: read by the crash handler (headless/crash_report.cpp) ----
+ * Signal-safe: fixed loops over the mapped tables, relaxed loads, no lock, no allocation, no stdio.
+ * A row being written meanwhile can come out half old, half new (counts off by one call). */
+struct eden_big_crash_head {
+  unsigned long long on, class_live, window_peak, window_peak_ms, now_ms, untracked, rows_full, reentry, refusals,
+      rows_used;
+};
+struct eden_big_crash_row {
+  unsigned long long row, live, blocks, peak, calls, bytes, grew_mib, refused, refused_last, depth, build, young;
+  char thread[16];
+  unsigned long long pcs[EDEN_BIG_PCS]; /* offsets from code start, 0: none */
+};
+/* Up to `most` rows (at most 16): 6 by young live bytes (blocks under 10 s old: the wave that is
+ * killing the run, review B), the largest by live now, and up to 4 rows with refusals; a row once.
+ * Returns how many; 0 and head->on 0 when off, or when the caller's layout differs (`row_size`). */
+static void eden_big_crash_insert(unsigned *rows, long long *keys, unsigned *n, unsigned room, unsigned r, long long key) {
+  if (room == 0 || key <= 0)
+    return;
+  unsigned place = *n;
+  if (*n < room)
+    ++*n;
+  else if (key <= keys[*n - 1])
+    return;
+  else
+    place = *n - 1;
+  while (place > 0 && keys[place - 1] < key) {
+    keys[place] = keys[place - 1];
+    rows[place] = rows[place - 1];
+    --place;
+  }
+  keys[place] = key;
+  rows[place] = r;
+}
+unsigned eden_big_crash_rows(struct eden_big_crash_head *head, struct eden_big_crash_row *out, unsigned most,
+                             unsigned long long row_size) {
+  struct eden_big_tables *tables = eden_big_tables_now();
+  head->on = tables != NULL && atomic_load_explicit(&eden_big_on, memory_order_relaxed);
+  if (!head->on || row_size != sizeof(struct eden_big_crash_row) || most == 0)
+    return 0;
+  const long long class_live = atomic_load_explicit(&eden_big_class_live, memory_order_relaxed);
+  head->class_live = class_live > 0 ? (unsigned long long)class_live : 0;
+  const long long peak = atomic_load_explicit(&eden_big_window_peak, memory_order_relaxed);
+  head->window_peak = peak > 0 ? (unsigned long long)peak : 0;
+  head->window_peak_ms = atomic_load_explicit(&eden_big_window_peak_ms, memory_order_relaxed);
+  head->now_ms = atomic_load_explicit(&eden_big_now_ms, memory_order_relaxed);
+  head->untracked = atomic_load_explicit(&eden_big_untracked, memory_order_relaxed);
+  head->rows_full = atomic_load_explicit(&eden_big_rows_full, memory_order_relaxed);
+  head->reentry = atomic_load_explicit(&eden_big_reentry, memory_order_relaxed);
+  head->refusals = atomic_load_explicit(&eden_big_refusals, memory_order_relaxed);
+  head->rows_used = atomic_load_explicit(&eden_big_rows_used, memory_order_relaxed);
+  enum { kMost = 16 };
+  if (most > kMost)
+    most = kMost;
+  const unsigned refused_room = most > 4 ? 4 : 0;
+  const unsigned young_room = most - refused_room > 6 ? 6 : (most - refused_room) / 2;
+  const unsigned live_room = most - refused_room - young_room;
+  /* Young bytes per row: a fixed pass over the blocks (relaxed loads, the crash handler's own array). */
+  long long *young = tables->crash_young;
+  const unsigned now_s = atomic_load_explicit(&eden_big_now_s, memory_order_relaxed);
+  for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r)
+    young[r] = 0;
+  for (unsigned b = 0; b < EDEN_BIG_BLOCKS; ++b) {
+    const struct eden_big_block *block = &tables->blocks[b];
+    if (atomic_load_explicit(&block->address, memory_order_relaxed) <= 1)
+      continue;
+    if (atomic_load_explicit(&block->born_s, memory_order_relaxed) + 10u > now_s)
+      young[atomic_load_explicit(&block->row, memory_order_relaxed) % EDEN_BIG_ROWS] +=
+          (long long)atomic_load_explicit(&block->size, memory_order_relaxed);
+  }
+  unsigned young_rows[kMost], live_rows[kMost], refused_rows[4], young_n = 0, live_n = 0, refused_n = 0;
+  long long young_key[kMost], live_key[kMost], refused_key[4];
+  for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r) {
+    const struct eden_big_row *row = &tables->rows[r];
+    if (!atomic_load_explicit(&row->ready, memory_order_acquire))
+      continue;
+    const unsigned long long refused = atomic_load_explicit(&row->refused, memory_order_relaxed);
+    if (refused != 0 && refused_room != 0) { /* a refused row is shown with the refused ones */
+      eden_big_crash_insert(refused_rows, refused_key, &refused_n, refused_room, r, (long long)refused);
+      continue;
+    }
+    eden_big_crash_insert(young_rows, young_key, &young_n, young_room, r, young[r]);
+  }
+  for (unsigned r = 0; r < EDEN_BIG_ROWS; ++r) {
+    const struct eden_big_row *row = &tables->rows[r];
+    if (!atomic_load_explicit(&row->ready, memory_order_acquire))
+      continue;
+    if (atomic_load_explicit(&row->refused, memory_order_relaxed) != 0 && refused_room != 0)
+      continue;
+    int taken = 0;
+    for (unsigned i = 0; i < young_n && !taken; ++i)
+      taken = young_rows[i] == r;
+    if (!taken)
+      eden_big_crash_insert(live_rows, live_key, &live_n, live_room, r,
+                            atomic_load_explicit(&row->live, memory_order_relaxed));
+  }
+  unsigned order[kMost + kMost + 4], order_n = 0;
+  for (unsigned i = 0; i < young_n; ++i)
+    order[order_n++] = young_rows[i];
+  for (unsigned i = 0; i < live_n; ++i)
+    order[order_n++] = live_rows[i];
+  for (unsigned i = 0; i < refused_n; ++i)
+    order[order_n++] = refused_rows[i];
+  const uintptr_t code = (uintptr_t)__eden_text_start;
+  unsigned n = 0;
+  for (unsigned i = 0; i < order_n && n < most; ++i) {
+    const unsigned r = order[i];
+    const struct eden_big_row *row = &tables->rows[r];
+    struct eden_big_crash_row *o = &out[n++];
+    const long long live = atomic_load_explicit(&row->live, memory_order_relaxed);
+    const long long blocks = atomic_load_explicit(&row->blocks, memory_order_relaxed);
+    const long long high = atomic_load_explicit(&row->peak, memory_order_relaxed);
+    o->row = r;
+    o->live = live > 0 ? (unsigned long long)live : 0;
+    o->blocks = blocks > 0 ? (unsigned long long)blocks : 0;
+    o->peak = high > 0 ? (unsigned long long)high : 0;
+    o->calls = atomic_load_explicit(&row->calls, memory_order_relaxed);
+    o->bytes = atomic_load_explicit(&row->bytes, memory_order_relaxed);
+    o->grew_mib = atomic_load_explicit(&row->grew, memory_order_relaxed) << (EDEN_HEAP_PIECE_SHIFT - 20);
+    o->refused = atomic_load_explicit(&row->refused, memory_order_relaxed);
+    o->refused_last = atomic_load_explicit(&row->refused_last, memory_order_relaxed);
+    o->depth = atomic_load_explicit(&row->depth, memory_order_relaxed);
+    o->build = row->build;
+    o->young = young[r] > 0 ? (unsigned long long)young[r] : 0;
+    for (unsigned k = 0; k < 16; ++k)
+      o->thread[k] = row->thread[k];
+    o->thread[15] = 0;
+    for (unsigned k = 0; k < EDEN_BIG_PCS; ++k) {
+      const uintptr_t pc = atomic_load_explicit(&row->pcs[k], memory_order_relaxed);
+      o->pcs[k] = pc >= code ? pc - code : 0;
+    }
+  }
+  return n;
+}
+
+/* ---- EDEN_UP_BIG_STACKS: operator new's EDEN_NEW_WAIT start / EDEN_HEAP_FAILURE lines (main.cpp) ----
+ * On the refused thread, after its request failed (not inside the allocator): " big_row=<row of this
+ * thread's last refused request when it is `requested` (same size, 256 KiB or more), or none> big_grew_ms=<since the older mark> big_grew=<the 4 records
+ * that grew the heap most since then, name:MiB>". "" when off. No allocation, no stdio. */
+static unsigned eden_big_put(char *out, unsigned size, unsigned at, const char *text) {
+  while (*text && at + 1 < size)
+    out[at++] = *text++;
+  out[at < size ? at : size - 1] = 0;
+  return at;
+}
+static unsigned eden_big_put_dec(char *out, unsigned size, unsigned at, unsigned long long value) {
+  char digits[24];
+  unsigned n = 0;
+  do {
+    digits[n++] = (char)('0' + value % 10u);
+    value /= 10u;
+  } while (value != 0 && n < sizeof(digits));
+  char text[24];
+  for (unsigned i = 0; i < n; ++i)
+    text[i] = digits[n - 1 - i];
+  text[n] = 0;
+  return eden_big_put(out, size, at, text);
+}
+unsigned eden_big_failure_text(char *out, unsigned size, unsigned long long requested) {
+  if (size == 0)
+    return 0;
+  out[0] = 0;
+  struct eden_big_tables *tables = eden_big_tables_now();
+  if (tables == NULL || !atomic_load_explicit(&eden_big_on, memory_order_relaxed) || size < 2)
+    return 0;
+  struct eden_heap_thread *self = eden_heap_self();
+  unsigned at = eden_big_put(out, size, 0, " big_row=");
+  /* Only when this thread's last refused request is this one (review S2): same size, 256 KiB or more. */
+  const struct eden_big_thread *mine = self != NULL ? &tables->threads[self - eden_heap_threads] : NULL;
+  const unsigned row = mine != NULL && requested >= EDEN_HEAP_SMALL_REQUEST &&
+                               atomic_load_explicit(&mine->refused_bytes, memory_order_relaxed) == requested
+                           ? atomic_load_explicit(&mine->refused_row, memory_order_relaxed)
+                           : 0;
+  at = row != 0 ? eden_big_put_dec(out, size, at, row - 1) : eden_big_put(out, size, at, "none");
+  const unsigned older = atomic_load_explicit(&eden_big_mark_at, memory_order_acquire) ^ 1u;
+  const unsigned long long since = atomic_load_explicit(&eden_big_mark_ms[older], memory_order_relaxed);
+  const unsigned long long now_ms = atomic_load_explicit(&eden_big_now_ms, memory_order_relaxed);
+  at = eden_big_put(out, size, at, " big_grew_ms=");
+  at = eden_big_put_dec(out, size, at, since != 0 && now_ms >= since ? now_ms - since : 0);
+  at = eden_big_put(out, size, at, " big_grew=");
+  unsigned top[4], grew[4], count = 0;
+  for (unsigned r = 0; r < EDEN_HEAP_THREADS; ++r) {
+    const unsigned now = __atomic_load_n(&eden_heap_threads[r].grown, __ATOMIC_RELAXED);
+    const unsigned then = atomic_load_explicit(&tables->threads[r].grown_mark[older], memory_order_relaxed);
+    const unsigned delta = since != 0 && now > then ? now - then : 0;
+    if (delta == 0)
+      continue;
+    unsigned place = count;
+    if (count < 4)
+      ++count;
+    else if (delta <= grew[3])
+      continue;
+    else
+      place = 3;
+    while (place > 0 && grew[place - 1] < delta) {
+      grew[place] = grew[place - 1];
+      top[place] = top[place - 1];
+      --place;
+    }
+    grew[place] = delta;
+    top[place] = r;
+  }
+  if (count == 0)
+    at = eden_big_put(out, size, at, "none");
+  for (unsigned i = 0; i < count; ++i) {
+    char name[16], clean[16];
+    for (unsigned k = 0; k < 16; ++k)
+      name[k] = __atomic_load_n(&eden_heap_threads[top[i]].name[k], __ATOMIC_RELAXED);
+    name[15] = 0;
+    if (i)
+      at = eden_big_put(out, size, at, ",");
+    at = eden_big_put(out, size, at, eden_big_name(name, clean));
+    at = eden_big_put(out, size, at, ":");
+    at = eden_big_put_dec(out, size, at, (unsigned long long)grew[i] << (EDEN_HEAP_PIECE_SHIFT - 20));
+  }
+  return at;
+}
+
 /* ---- Who holds what the heap does not use (reports, in stderr.log) ---- */
 
 /* The name a thread gave itself, kept with its record (the SetCurrentThreadName hook). */
@@ -1736,6 +3648,7 @@ void eden_heap_name_thread(const char *name) {
   for (; length + 1 < sizeof(self->name) && name[length] != 0; ++length)
     __atomic_store_n(&self->name[length], name[length], __ATOMIC_RELAXED);
   __atomic_store_n(&self->name[length], 0, __ATOMIC_RELAXED);
+  eden_big_note_stack(self); /* EDEN_UP_BIG_STACKS: nothing when off */
 }
 
 /* Every 20 s, and cheap: which requests made the heap grow (MiB, and the largest request), what the
@@ -1756,6 +3669,20 @@ void eden_heap_growth_report(void) {
                            << (EDEN_HEAP_PIECE_SHIFT - 20),
                        atomic_load_explicit(&eden_heap_grew_largest[kind], memory_order_relaxed) >> 10);
   fprintf(stderr, "%s (MiB/largest KiB)\n", line);
+  /* EDEN_UP_HEAP_ADOPT_WIDE (0880): the looks that went past the first 16 arenas, their asks, the
+   * arenas taken there (each a new arena not made: 2 MiB of the heap), and their time. On only. */
+  const unsigned wide = atomic_load_explicit(&eden_heap_adopt_wide, memory_order_relaxed);
+  if (wide != 0) {
+    const unsigned long long wide_us = atomic_load_explicit(&eden_heap_adopt_wide_us, memory_order_relaxed);
+    fprintf(stderr, "EDEN_HEAP_ADOPT_WIDE n=%u looks=%llu asks=%llu taken=%llu (%llu MiB of arenas not made) ms=%llu.%03llu max_us=%llu\n",
+            wide, (unsigned long long)atomic_load_explicit(&eden_heap_adopt_wide_scans, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&eden_heap_adopt_wide_asks, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&eden_heap_adopt_wide_hits, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&eden_heap_adopt_wide_hits, memory_order_relaxed)
+                << (EDEN_HEAP_ARENA_SHIFT - 20),
+            wide_us / 1000u, wide_us % 1000u,
+            (unsigned long long)atomic_load_explicit(&eden_heap_adopt_wide_max_us, memory_order_relaxed));
+  }
   /* Blocks under 32 MiB with memory of their own (EDEN_HEAP_LARGE_MIB). Cycles are the TSC's. */
   fprintf(stderr, "EDEN_HEAP_MID from=%zuKiB taken=%llu taken_mib=%llu refused=%llu alive=%u alive_mib=%zu peak_mib=%zu "
                   "cycles_m=%llu large_entries=%u of %u table_full=%llu\n",
@@ -1778,6 +3705,28 @@ void eden_heap_growth_report(void) {
           (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[2], memory_order_relaxed) >> 20,
           (unsigned long long)atomic_load_explicit(&eden_heap_class_count[3], memory_order_relaxed),
           (unsigned long long)atomic_load_explicit(&eden_heap_class_bytes[3], memory_order_relaxed) >> 20);
+  /* RADV_PS5_LONGLIVED_ARENA (0 or 1): the heap's slack and the long-lived set, every 20 s. */
+  if (atomic_load_explicit(&eden_heap_ll_mode, memory_order_relaxed) >= 0) {
+    char now[320];
+    eden_heap_ll_snapshot(now, sizeof(now));
+    fprintf(stderr, "EDEN_HEAP_LONG_LIVED now: %s\n", now);
+  }
+}
+
+/* RADV_PS5_LONGLIVED_ARENA (0 or 1; unset: nothing): the heap before and after a trim, for the boot's
+ * end (main.cpp, after the boot pipelines are built) and any other moment a caller names. Two lines;
+ * the trim is the one every refusal and session end already makes (eden_heap_trim). */
+void eden_heap_long_lived_report(const char *why) {
+  if (atomic_load_explicit(&eden_heap_ll_mode, memory_order_relaxed) < 0)
+    return;
+  char before[320], after[320];
+  eden_heap_ll_snapshot(before, sizeof(before));
+  const size_t gave = eden_heap_trim();
+  eden_heap_ll_snapshot(after, sizeof(after));
+  fprintf(stderr, "EDEN_HEAP_LONG_LIVED %s mode=%d before trim: %s\n", why ? why : "-",
+          atomic_load_explicit(&eden_heap_ll_mode, memory_order_relaxed), before);
+  fprintf(stderr, "EDEN_HEAP_LONG_LIVED %s mode=%d after trim (gave back %zu MiB): %s\n", why ? why : "-",
+          atomic_load_explicit(&eden_heap_ll_mode, memory_order_relaxed), gave >> 20, after);
 }
 
 /* The room left in an mspace, found by asking it: blocks of `top` while it gives them, then of half
@@ -2529,7 +4478,10 @@ static void *eden_heap_allocate(size_t count, size_t size, int zero) {
   }
   void *address;
   if (bytes < EDEN_HEAP_SMALL_REQUEST) {
-    address = eden_heap_arena_allocate(count, size, zero);
+    /* RADV_PS5_LONGLIVED_ARENA=1: a kept object goes to the long-lived set (off: one load). */
+    address = eden_heap_ll_route(bytes) ? eden_heap_ll_allocate(count, size, zero, 0) : NULL;
+    if (address == NULL)
+      address = eden_heap_arena_allocate(count, size, zero);
     if (address == NULL)
       address = eden_heap_spill(count, size, zero);
   } else {
@@ -2606,6 +4558,110 @@ void eden_heap_want(int enter) {
     atomic_fetch_add_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
   else
     atomic_fetch_sub_explicit(&eden_heap_waiting, 1, memory_order_relaxed);
+}
+
+/* EDEN_UP_DOOR_WAIT (0597, our own): run-time pipeline build JOBS in flight on a builder thread.
+ * The core counts each whole job (video_core/renderer_vulkan/vk_door_job.h, a scope beside 0592's
+ * BuildBurst::Job in the graphics and compute build lambdas; only with EDEN_UP_DOOR_WAIT=1 or
+ * EDEN_UP_BUILD_GIVE_BACK=1, read once there), so operator new's handler (headless/main.cpp) can
+ * tell "a build is in flight or just ended" without calling into the video core. Counters only:
+ * no lock, no wait, no allocation, no line. Nothing calls these with both switches off. */
+static atomic_uint eden_door_jobs_now;
+static atomic_ullong eden_door_jobs_ended;  /* the "ended" generation: one per finished job */
+static atomic_ullong eden_door_last_end_us; /* sceKernelGetProcessTime() of the last end; 0: none */
+
+/* EDEN_UP_BUILD_GIVE_BACK=1 (0598, our own; set by main once the env files are in): when the last
+ * builder job in flight ends, the heap gives its empty spaces back to the pool at once
+ * (eden_heap_trim: the existing call of operator new's wait, the JIT's wait, TrimHeap and the session
+ * end; whole spaces with no block in them, and the empty arenas to the spares), on the builder
+ * thread that ended it: after its driver call and its build_mutex block (the draw waiting for it was
+ * told first), outside the driver and every lock of the builders, never in a signal handler. Today
+ * the heap trims only when someone is short or waits; run1323 died with 520 MiB of whole free
+ * pages in the heap and the pool at 0. One give-back at a time (a second one meanwhile is counted
+ * busy and skipped). A line only when memory went back:
+ * "EDEN_BUILD_GIVE_BACK gave_mib= ms= calls= empty= busy=" (counts since the start). Off: one
+ * relaxed load at a job end, and job ends are counted only while one of the two switches is on. */
+static atomic_uint eden_door_give_back_on;
+static atomic_flag eden_door_giving_back = ATOMIC_FLAG_INIT;
+static atomic_ullong eden_door_give_back_calls, eden_door_give_back_empty, eden_door_give_back_busy;
+
+void eden_door_set_give_back(int on) {
+  atomic_store_explicit(&eden_door_give_back_on, on ? 1u : 0u, memory_order_relaxed);
+}
+
+static void eden_door_give_back(void) {
+  if (atomic_flag_test_and_set_explicit(&eden_door_giving_back, memory_order_acquire)) {
+    atomic_fetch_add_explicit(&eden_door_give_back_busy, 1, memory_order_relaxed);
+    return;
+  }
+  const unsigned long long from = (unsigned long long)sceKernelGetProcessTime();
+  const size_t gave = eden_heap_trim();
+  const unsigned long long took = (unsigned long long)sceKernelGetProcessTime() - from;
+  const unsigned long long calls = atomic_fetch_add_explicit(&eden_door_give_back_calls, 1, memory_order_relaxed) + 1;
+  if (gave == 0)
+    atomic_fetch_add_explicit(&eden_door_give_back_empty, 1, memory_order_relaxed);
+  atomic_flag_clear_explicit(&eden_door_giving_back, memory_order_release);
+  if (gave != 0)
+    fprintf(stderr, "EDEN_BUILD_GIVE_BACK gave_mib=%llu ms=%llu.%03llu calls=%llu empty=%llu busy=%llu\n",
+            (unsigned long long)(gave >> 20), took / 1000u, took % 1000u, calls,
+            (unsigned long long)atomic_load_explicit(&eden_door_give_back_empty, memory_order_relaxed),
+            (unsigned long long)atomic_load_explicit(&eden_door_give_back_busy, memory_order_relaxed));
+}
+
+void eden_door_job(int enter) {
+  if (enter) {
+    atomic_fetch_add_explicit(&eden_door_jobs_now, 1, memory_order_acq_rel);
+    return;
+  }
+  unsigned now = atomic_load_explicit(&eden_door_jobs_now, memory_order_relaxed);
+  do {
+    if (now == 0)
+      return; /* an end with no begin (cannot happen with the scope): never wraps */
+  } while (!atomic_compare_exchange_weak_explicit(&eden_door_jobs_now, &now, now - 1, memory_order_acq_rel,
+                                                  memory_order_relaxed));
+  atomic_store_explicit(&eden_door_last_end_us, (unsigned long long)sceKernelGetProcessTime() | 1u,
+                        memory_order_relaxed);
+  atomic_fetch_add_explicit(&eden_door_jobs_ended, 1, memory_order_release);
+  if (now == 1 && atomic_load_explicit(&eden_door_give_back_on, memory_order_relaxed))
+    eden_door_give_back(); /* EDEN_UP_BUILD_GIVE_BACK: the last job in flight ended */
+}
+
+/* Jobs in flight now; `ended`: jobs finished since start; `since_end_ms`: ms since the last one
+ * ended (~0 when none has). Loads and one clock read. */
+unsigned eden_door_jobs(unsigned long long *ended, unsigned long long *since_end_ms) {
+  if (ended)
+    *ended = atomic_load_explicit(&eden_door_jobs_ended, memory_order_acquire);
+  if (since_end_ms) {
+    const unsigned long long last = atomic_load_explicit(&eden_door_last_end_us, memory_order_relaxed);
+    const unsigned long long now = (unsigned long long)sceKernelGetProcessTime();
+    *since_end_ms = last == 0 ? ~0ull : now > last ? (now - last) / 1000u : 0;
+  }
+  return atomic_load_explicit(&eden_door_jobs_now, memory_order_acquire);
+}
+
+/* 1 when the calling thread may wait for builder jobs in operator new's handler: by the name on its
+ * heap record (RegisterWorker, headless/performance.cpp), the file-service thread "FS" (6 of 12 door
+ * deaths) and the guest CPU cores "CPUCore_<n>", and only outside a run-time build scope
+ * (eden_heap_wait_scope). Every other thread gets 0: the builders ("VkPipelineBuild"), the GPU
+ * threads ("GPUBack", "GPU", "GPUFencingThrea"), "VulkanWorker", the reporters ("MemCensus",
+ * "MemoryReport", "BigStacks", the burst reporter), the log flusher (its record has no name: it names
+ * itself for the crash report only), any unnamed thread and a thread with no record. Reads this
+ * thread's own record without claiming one. `out` (16 bytes, may be NULL): the name, "" when none. */
+int eden_door_may_wait(char out[16]) {
+  char name[16] = {0};
+  int may = 0;
+  if (eden_heap_arena_key_valid) {
+    const struct eden_heap_thread *self = pthread_getspecific(eden_heap_arena_key);
+    if (self != NULL) {
+      for (unsigned i = 0; i < sizeof(name); ++i)
+        name[i] = __atomic_load_n(&self->name[i], __ATOMIC_RELAXED);
+      name[sizeof(name) - 1] = 0;
+      may = self->wait_scope == 0 && (strcmp(name, "FS") == 0 || strncmp(name, "CPUCore_", 8) == 0);
+    }
+  }
+  if (out)
+    memcpy(out, name, sizeof(name));
+  return may;
 }
 
 void eden_heap_wait_stats(unsigned long long *count, unsigned long long *total_ms, unsigned *longest_ms,
@@ -2689,9 +4745,12 @@ static void *eden_heap_allocate_or_wait(size_t count, size_t size, int zero) {
 void *__wrap_malloc(size_t size) {
   if (!ps5_heap_ready())
     return __real_malloc(size);
-  void *cached = eden_tcache_take(size);
+  const long long big = eden_big_begin(size); /* EDEN_UP_BIG_STACKS: -1 when off */
+  /* RADV_PS5_LONGLIVED_ARENA=1: a kept object takes no cached block (those are the thread's arenas'). */
+  void *cached = eden_heap_ll_active() ? NULL : eden_tcache_take(size);
   void *block = cached != NULL ? cached : eden_heap_record(eden_heap_allocate_or_wait(1, size, 0), size);
   eden_site_alloc(block, size);
+  eden_big_end(block, size, big);
   return block;
 }
 
@@ -2702,13 +4761,16 @@ void *__wrap_calloc(size_t count, size_t size) {
     eden_heap_failed((size_t)-1, EDEN_HEAP_WHY_OVERFLOW);
     return NULL;
   }
-  void *cached = eden_tcache_take(count * size);
+  const long long big = eden_big_begin(count * size); /* EDEN_UP_BIG_STACKS: -1 when off */
+  void *cached = eden_heap_ll_active() ? NULL : eden_tcache_take(count * size); /* as __wrap_malloc */
   if (cached != NULL) {
     eden_site_alloc(cached, count * size);
+    eden_big_end(cached, count * size, big);
     return memset(cached, 0, count * size);
   }
   void *block = eden_heap_record(eden_heap_allocate_or_wait(count, size, 1), count * size);
   eden_site_alloc(block, count * size);
+  eden_big_end(block, count * size, big);
   return block;
 }
 
@@ -2769,10 +4831,24 @@ static void *eden_realloc_inner(void *address, size_t size) {
 void *__wrap_realloc(void *address, size_t size) {
   if (address == NULL)
     return __wrap_malloc(size);
-  if (ps5_heap_owns(address))
-    eden_site_free(address, eden_heap_usable(address));
+  size_t usable = 0;
+  const int owned = ps5_heap_owns(address);
+  if (owned) {
+    usable = eden_heap_usable(address);
+    eden_site_free(address, usable);
+  }
+  /* EDEN_UP_BIG_STACKS: the old block leaves the table first (its address may come back as the
+   * result), and goes back to its row if the realloc fails and the block stays. One load when off. */
+  const int big_on = owned && (usable >= EDEN_HEAP_SMALL_REQUEST || size >= EDEN_HEAP_SMALL_REQUEST) &&
+                     atomic_load_explicit(&eden_big_on, memory_order_relaxed);
+  unsigned long long big_old = 0;
+  const unsigned big_row = big_on && usable >= EDEN_HEAP_SMALL_REQUEST ? eden_big_detach(address, &big_old) : 0;
+  const long long big = big_on && size >= EDEN_HEAP_SMALL_REQUEST ? eden_big_grown_now() : -1;
   void *result = eden_realloc_inner(address, size);
   eden_site_alloc(result, size);
+  if (big_row != 0 && result == NULL && size != 0)
+    eden_big_reattach(address, big_row, big_old);
+  eden_big_end(result, size, big);
   return result;
 }
 
@@ -2780,8 +4856,10 @@ void __wrap_free(void *address) {
   if (eden_heap_in_range(address)) {
     const size_t usable = sceLibcMspaceMallocUsableSize(address);
     eden_site_free(address, usable);
+    eden_big_free(address, usable); /* EDEN_UP_BIG_STACKS */
     eden_pages_count(address, usable, -1);
-    if (eden_tcache_keep(address, usable))
+    /* RADV_PS5_LONGLIVED_ARENA=1: a kept object's block goes straight back to its arena (off: one load). */
+    if (!eden_heap_ll_block(address) && eden_tcache_keep(address, usable))
       return;
     eden_heap_account(-(long)usable, -1);
     eden_heap_release(address);
@@ -2790,6 +4868,7 @@ void __wrap_free(void *address) {
   const int large = eden_heap_large_find(address);
   if (large >= 0) {
     eden_site_free(address, eden_heap_large[large].size);
+    eden_big_free(address, eden_heap_large[large].size); /* EDEN_UP_BIG_STACKS */
     eden_heap_account(-(long)eden_heap_large[large].size, -1);
     eden_heap_large_free(large);
   } else
@@ -2800,6 +4879,9 @@ void __wrap_free(void *address) {
 static void *eden_heap_aligned_try(size_t alignment, size_t size) {
   void *block = NULL;
   if (size < EDEN_HEAP_SMALL_REQUEST && alignment <= 4096) {
+    /* RADV_PS5_LONGLIVED_ARENA=1: a kept object goes to the long-lived set (off: one load). */
+    if (eden_heap_ll_route(size) && (block = eden_heap_ll_allocate(1, size, 0, alignment)) != NULL)
+      return block;
     void *arena = eden_heap_thread_arena();
     if (arena != NULL) {
       if (sceLibcMspacePosixMemalign(arena, &block, alignment, size) == 0) {
@@ -2829,6 +4911,7 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   if (alignment < sizeof(void *) || (alignment & (alignment - 1)) != 0)
     return EINVAL;
   int result = ENOMEM;
+  const long long big = eden_big_begin(size); /* EDEN_UP_BIG_STACKS: -1 when off */
   {
     void *block = eden_heap_aligned_try(alignment, size);
     /* EDEN_UP_HEAP_WAIT_MS: a pipeline builder asks again until it is served or the time is up. */
@@ -2845,8 +4928,11 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   if (result == 0) {
     eden_heap_record(*address, size);
     eden_site_alloc(*address, size);
-  } else
+    eden_big_end(*address, size, big);
+  } else {
     eden_heap_failed(size, atomic_load_explicit(&eden_heap_grow_why, memory_order_relaxed));
+    eden_big_end(NULL, size, big);
+  }
   return result;
 }
 

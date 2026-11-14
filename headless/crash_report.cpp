@@ -35,6 +35,19 @@ std::size_t eden_heap_large_held(unsigned* blocks);
 // The app's code, from the link (tools/unwind.ld).
 extern const char __eden_text_start[];
 extern const char __eden_text_end[];
+// EDEN_UP_BIG_STACKS (headless/heap_arenas.inc, the same layout there): the large requests' rows,
+// read with relaxed loads only (no lock, no allocation). 0 rows and on 0 when the switch is off.
+struct eden_big_crash_head {
+    unsigned long long on, class_live, window_peak, window_peak_ms, now_ms, untracked, rows_full, reentry,
+        refusals, rows_used;
+};
+struct eden_big_crash_row {
+    unsigned long long row, live, blocks, peak, calls, bytes, grew_mib, refused, refused_last, depth, build, young;
+    char thread[16];
+    unsigned long long pcs[32];  // offsets from the code's start (eboot+): 16 frame-chain links, 16 scan words; 0: none
+};
+unsigned eden_big_crash_rows(eden_big_crash_head* head, eden_big_crash_row* out, unsigned most,
+                             unsigned long long row_size) __attribute__((weak));
 }
 
 extern "C" {
@@ -88,6 +101,8 @@ char version[40];
 char sessions[2][400];
 std::atomic<unsigned> session_now{0};
 std::atomic<bool> reported{false};  // the report is written: the helper threads act
+std::atomic<bool> extra_flushed{false};      // T175d: ExtraFlusher is done
+std::atomic<bool> extra_flusher_started{false};
 int probe_pipe[2] = {-1, -1};       // memory is read through it (Copy)
 
 std::uintptr_t CodeStart() noexcept { return reinterpret_cast<std::uintptr_t>(__eden_text_start); }
@@ -302,6 +317,77 @@ void PutRegister(const char* before, const char* name, std::uint64_t value) noex
     report.Hex(value, 16);
 }
 
+// EDEN_UP_BIG_STACKS: who holds the large requests now, from static rows: first the rows with the most
+// live bytes in blocks under 10 s old (young_mib), then the largest by live now, then the refused ones.
+// 16 rows of about 450 characters (7 KiB of the 24): room is left for the calls below.
+void PutBigRequests() noexcept {
+    if (!eden_big_crash_rows) return;
+    static eden_big_crash_head head;
+    static eden_big_crash_row rows[16];
+    head = {};
+    const unsigned count = eden_big_crash_rows(&head, rows, 16, sizeof(eden_big_crash_row));
+    if (!head.on) return;
+    auto& t = report;
+    t.Put("big requests (>= 256 KiB, EDEN_UP_BIG_STACKS): class live ");
+    t.Dec(head.class_live >> 20);
+    t.Put(" MiB, window peak ");
+    t.Dec(head.window_peak >> 20);
+    t.Put(" MiB at steady_ms ");
+    t.Dec(head.window_peak_ms);
+    t.Put(" (now ");
+    t.Dec(head.now_ms);
+    t.Put("), rows ");
+    t.Dec(head.rows_used);
+    t.Put(", rows_full ");
+    t.Dec(head.rows_full);
+    t.Put(", untracked ");
+    t.Dec(head.untracked >> 20);
+    t.Put(" MiB, refusals ");
+    t.Dec(head.refusals);
+    t.Put('\n');
+    for (unsigned i = 0; i < count; ++i) {
+        const eden_big_crash_row& r = rows[i];
+        t.Put("  big row ");
+        t.Dec(r.row);
+        t.Put(" thread=");
+        t.Put(r.thread[0] ? r.thread : "?");
+        t.Put(" build=");
+        t.Dec(r.build);
+        t.Put(" young_mib=");
+        t.Dec(r.young >> 20);
+        t.Put(" live_mib=");
+        t.Dec(r.live >> 20);
+        t.Put(" blocks=");
+        t.Dec(r.blocks);
+        t.Put(" peak_mib=");
+        t.Dec(r.peak >> 20);
+        t.Put(" calls=");
+        t.Dec(r.calls);
+        t.Put(" grew_mib=");
+        t.Dec(r.grew_mib);
+        t.Put(" refused=");
+        t.Dec(r.refused);
+        t.Put(" last_refused=");
+        t.Dec(r.refused_last);
+        t.Put(" depth=");
+        t.Dec(r.depth & 0xFF);
+        t.Put('+');
+        t.Dec((r.depth >> 8) & 0xFF);
+        const unsigned long long total = (r.depth >> 17) & 0x1FF;  // the walk's links in the app's code
+        t.Put(" chain_total=");
+        t.Dec(total);
+        t.Put(" pcs=");
+        for (unsigned k = 0; k < 32; ++k) {
+            if (k == 16) t.Put('|');
+            if (k == 12 && total > 16) t.Put(",..");  // links between the 12th and the outermost 4 left out
+            if (r.pcs[k] == 0) continue;
+            if (k != 0 && k != 16) t.Put(',');
+            t.Hex(r.pcs[k]);
+        }
+        t.Put('\n');
+    }
+}
+
 // The report, complete in its buffer.
 void Compose(const Kind* kind, int code, std::uint64_t address, const Registers& r, const char* reason,
              const Stamp& stamp, bool restart) noexcept {
@@ -377,6 +463,7 @@ void Compose(const Kind* kind, int code, std::uint64_t address, const Registers&
         t.Put(" large blocks\n");
     }
 #endif
+    PutBigRequests();
     t.Put("registers:");
     PutRegister("\n  ", "rip", r.rip);
     PutRegister("  ", "rsp", r.rsp);
@@ -528,6 +615,10 @@ void WaitForReport() noexcept {
 void Restarter() {
     WaitForReport();
     Sleep(300000);  // what was printed reaches the log files (log_flusher.h)
+    // T175d (EDEN_UP_LOG_FLUSH_MS): eden_log.txt's buffered lines, written by ExtraFlusher; a write
+    // to a slow /data can take about a second. Up to 2 s more; never set: no wait, as before.
+    if (extra_flush.load(std::memory_order_acquire))
+        for (int i = 0; i < 40 && !extra_flushed.load(std::memory_order_acquire); ++i) Sleep(50000);
     if (!leave.load(std::memory_order_acquire)) eden_restart_app();
     eden_exit_app();
     helper_failed.store(true, std::memory_order_release);
@@ -539,6 +630,14 @@ void Flusher() {
     WaitForReport();
     std::fflush(stderr);
     std::fflush(stdout);
+}
+
+// T175d (EDEN_UP_LOG_FLUSH_MS): started by the first SetExtraFlush; writes eden_log.txt's buffered
+// lines out at a crash, on its own (a lock the crashed thread holds stops only this thread).
+void ExtraFlusher() {
+    WaitForReport();
+    if (void (*flush)() = extra_flush.load(std::memory_order_acquire)) flush();
+    extra_flushed.store(true, std::memory_order_release);
 }
 
 void CopyText(char* target, std::size_t size, const char* text) noexcept {
@@ -769,6 +868,17 @@ void DumpWatcher() {
 }
 
 } // namespace
+
+void SetExtraFlush(void (*flush)()) noexcept {
+    extra_flush.store(flush, std::memory_order_release);
+    if (flush != nullptr && !extra_flusher_started.exchange(true, std::memory_order_acq_rel)) {
+        try {
+            std::thread(ExtraFlusher).detach();
+        } catch (...) {
+            // No thread: the restarting helper's wait ends after its 2 s.
+        }
+    }
+}
 
 bool Readable(const void* address, std::size_t bytes) noexcept {
     char buffer[4096];

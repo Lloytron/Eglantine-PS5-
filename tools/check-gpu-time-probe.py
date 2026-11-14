@@ -56,7 +56,7 @@ struct Device {
  const Physical& GetPhysical()const{return physical;}
  unsigned GetGraphicsFamily()const{return 0;}
 };
-'''+f'\n#include "{root}/headless/submission_origin.h"\n'+(root/'headless/gpu_time_probe.inc').read_text()+r'''
+'''+'\n// The EDEN_UP_GPU_PASS_TIME half needs the real Vulkan types; this check covers the rest.\n#define EDEN_GPU_TIME_PROBE_CHECK 1\n'+f'\n#include "{root}/headless/submission_origin.h"\n'+(root/'headless/gpu_time_probe.inc').read_text()+r'''
 int main(){Device d;vk::CommandBuffer cmd;
  Eden::DevVulkan::gpu_time=true;
  auto caller=reinterpret_cast<const void*>(uintptr_t(0x1234));

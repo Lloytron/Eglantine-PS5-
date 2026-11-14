@@ -10,10 +10,39 @@
 #include <optional>
 #include "common/cpu_features.h"
 
+// 0844: the Vulkan driver's count of its disk cache writes still queued in memory (Mesa's
+// disk_cache queue, "disk$" threads). Defined in performance.cpp as null; a driver that offers the
+// count sets it when it makes its disk cache, as RADV's winsys sets eden_radv_stall_dump
+// (crash_report.cpp). T172: lead-mesh-41 sets it while the driver counts its puts
+// (RADV_PS5_CACHE_FAST=1, RADV_PS5_DISK_CACHE_STATS=1 or RADV_PS5_DISK_CACHE_DRAIN_EXIT=<s>). main.cpp
+// waits only with EDEN_UP_PREPASS_CACHE_WAIT_S=<s> (T166 review: off by default), and with a null
+// count says so and waits for nothing.
+extern "C" unsigned long long (*eden_radv_disk_cache_queued)(void);
+// 0844 (T172): the driver's bounded drain, radv_ps5_disk_cache_drain(timeout_ms) (lead-mesh-35): it
+// waits up to timeout_ms for the queued puts, then writes the index entries its database parts hold
+// back (lead-mesh-32), and prints one "RADV_PS5_CACHE drain:" line; true when no put was left.
+// Null here; lead-mesh-41 sets it with RADV_PS5_CACHE_FAST=1. main.cpp calls it once after the wait.
+extern "C" bool (*eden_radv_disk_cache_drain)(unsigned timeout_ms);
+// T175d (lead-mesh-44): objects added to or removed from a VkPipelineCache the app holds, since
+// the process started (the objects its initial data gave, and their lookups, are not counted). Null until
+// the driver makes a pipeline cache. main.cpp's EDEN_UP_DRIVER_CACHE_SKIP_SAME reads it.
+extern "C" unsigned long long (*eden_radv_pipeline_cache_changes)(void);
+
 namespace Eden::Performance {
 void RegisterWorker(const char* name);
 // Development: keep other named threads off guest cores 0-2 and their SMT siblings.
 void SetSecondaryPlacement(bool enabled);
+// 0840: a game's session begins (before its shader cache is read) and its guest code starts
+// (main.cpp, at the EDEN_GUEST_START line). Until then the before-play pass's threads
+// (ShaderSetPrepass) may use every CPU the process is allowed (EDEN_UP_PREPASS_ALL_CORES=1); at the
+// guest start the ones still running go back on the shared mask.
+void NoteSessionStart();
+void NoteGuestStart();
+// 0841: with EDEN_UP_SHADER_SET_PREPASS=1 the core's background shader set pass (thread
+// "ShaderSet") waits EDEN_UP_PREPASS_BACKGROUND_AFTER_S (unset: no wait) after NoteGuestStart before it
+// starts. main.cpp calls this before the game is stopped, so the cache's destructor never waits
+// on a held thread.
+void ReleaseBackgroundHold();
 void PlatformChecks();
 // Main thread only, between GPU readiness and guest shutdown.
 void Snapshot();

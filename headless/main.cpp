@@ -27,8 +27,41 @@
 #include <sys/stat.h>
 extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 extern "C" size_t eden_heap_trim(void) __attribute__((weak));
+// EDEN_UP_HEAP_HOLD_AT_LOAD (heap_arenas.inc): the same trim, which a hold does not stop (the heap's
+// own waits below: empty spaces back, then a growth large enough).
+extern "C" size_t eden_heap_trim_unheld(void) __attribute__((weak));
+// RADV_PS5_LONGLIVED_ARENA (0 or 1; unset: returns at once): the heap before and after a trim (T175b).
+extern "C" void eden_heap_long_lived_report(const char* why) __attribute__((weak));
 // headless/heap_pages.cpp (the native build only): the pool switches, read once env.txt is in.
 extern "C" void eden_heap_pool_init(void) __attribute__((weak));
+// EDEN_POOL_LEDGER_EXACT=1 (src/direct_memory.c), decided once env.txt is applied.
+extern "C" void eden_direct_ledger_exact_init(void) __attribute__((weak));
+// EDEN_UP_BIG_STACKS (headless/heap_arenas.inc): text for operator new's failure lines, 0 when off.
+// big_row= names this thread's last refused request only when it is `requested` (else none).
+extern "C" unsigned eden_big_failure_text(char* out, unsigned size, unsigned long long requested) __attribute__((weak));
+// EDEN_UP_DOOR_WAIT (0597, headless/heap_arenas.inc): builder jobs in flight, and whether this thread
+// may wait for them; eden_heap_want: a request waits (the caches see memory short).
+extern "C" unsigned eden_door_jobs(unsigned long long* ended, unsigned long long* since_end_ms) __attribute__((weak));
+extern "C" int eden_door_may_wait(char* name16) __attribute__((weak));
+extern "C" void eden_heap_want(int enter) __attribute__((weak));
+// EDEN_UP_BUILD_GIVE_BACK (0598, headless/heap_arenas.inc): empty heap spaces back to the pool when the
+// last builder job in flight ends.
+extern "C" void eden_door_set_give_back(int on) __attribute__((weak));
+// 0663 (waveydude's 0918; video_core/texture_cache/texture_cache.h ReserveEvictionWritebackScratch,
+// EDEN_NX2_DEFER_WRITEBACK_OOM=1): a request this thread can go without, because its caller keeps
+// the image when it is refused. Inside the scope operator new's handler refuses at once: no door
+// wait, no EDEN_UP_NEW_WAIT_MS wait, no EDEN_HEAP_FAILURE line, no heap snapshot. Only that caller
+// enters it; with the switch off the depth stays 0 and the handler is as before.
+namespace {
+thread_local unsigned optional_allocation_depth{};
+}
+extern "C" void eden_optional_allocation_scope(bool enter) noexcept {
+    if (enter) {
+        ++optional_allocation_depth;
+    } else {
+        --optional_allocation_depth;
+    }
+}
 #endif
 #ifdef EDEN_DEV_VULKAN
 #include "sdk_audit.h"
@@ -62,6 +95,7 @@ extern "C" void eden_heap_pool_init(void) __attribute__((weak));
 #include "graphics.h"
 #include "video_core/renderer_base.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/shader_set_progress.h"
 #endif
 #ifdef PS5_NATIVE
 #include "native_directory.h"
@@ -278,6 +312,142 @@ inline bool TrimEnvLine(std::string& line) {
     return true;
 }
 
+#ifdef PS5_NATIVE
+// EDEN_UP_DOOR_WAIT (0597; rules in memory_wait.h): called by operator new's handler after a refusal
+// of `bytes`. 0: no door wait here (the handler goes on as before); 1: served (the handler returns
+// and operator new tries again); 2: the door wait ended unserved (the handler refuses at once: one
+// bound per episode, no second wait after it). Holds no lock while it waits; its two lines go to the
+// C stream stderr with no lock of the builders held. Off (door_max_ms 0): one relaxed load.
+static int DoorWait(std::size_t bytes, unsigned new_wait_ms) {
+    namespace MemoryWait = Eden::MemoryWait;
+    const unsigned door_ms = MemoryWait::door_max_ms.load(std::memory_order_relaxed);
+    if (door_ms == 0) return 0;
+    if (!eden_door_jobs || !eden_door_may_wait || !MemoryWait::WorthWaitingFor(bytes)) return 0;
+    struct Door {
+        std::uint64_t start_ms = 0;
+        std::uint64_t served_ms = 0;
+        std::uint64_t cooldown_until_ms = 0;
+        bool served = false;
+    };
+    thread_local Door door;
+    const auto now_ms = [] {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                              std::chrono::steady_clock::now().time_since_epoch())
+                                              .count());
+    };
+    std::uint64_t now = now_ms();
+    if (now < door.cooldown_until_ms) return 0;
+    unsigned long long ended = 0, since_end_ms = 0;
+    unsigned jobs = eden_door_jobs(&ended, &since_end_ms);
+    if (jobs == 0 && since_end_ms >= MemoryWait::DoorRecentMs) return 0;
+    char name[16];
+    if (!eden_door_may_wait(name)) return 0;
+    // One bound for the episode: the door limit, never shorter than EDEN_UP_NEW_WAIT_MS.
+    const unsigned limit = std::max(door_ms, new_wait_ms);
+    // A refusal right after a served wait (its memory taken before operator new's own try)
+    // continues that episode and its bound; any later one starts a new episode.
+    const bool again = door.served && now - door.served_ms <= MemoryWait::EpisodeGapMs;
+    door.served = false;
+    if (!again) door.start_ms = now;
+    std::fprintf(stderr, "EDEN_DOOR_WAIT start thread=%s requested=%zu jobs=%u ended=%llu limit_ms=%u again=%d\n",
+                 name[0] ? name : "?", bytes, jobs, ended, limit, again ? 1 : 0);
+    const unsigned long long ended_at_start = ended;
+    unsigned long long trimmed_at = ended;
+    std::uint64_t last_trim_ms = now;
+    if (eden_heap_trim) (void)(eden_heap_trim_unheld ? eden_heap_trim_unheld() : eden_heap_trim());
+    if (eden_heap_want) eden_heap_want(1);
+    const char* result = "timeout";
+    for (;;) {
+        usleep(20000);
+        now = now_ms();
+        jobs = eden_door_jobs(&ended, &since_end_ms);
+        // Right after a job ended (its memory is back in the heap's spaces), and every 500 ms.
+        if (ended != trimmed_at || now - last_trim_ms >= MemoryWait::TrimEveryMs) {
+            trimmed_at = ended;
+            last_trim_ms = now;
+            if (eden_heap_trim) (void)(eden_heap_trim_unheld ? eden_heap_trim_unheld() : eden_heap_trim());
+        }
+        // The bound first (review): an again=1 chain whose tries are served while operator new's own
+        // try keeps failing (another thread takes the memory, or `requested` is another thread's
+        // size) would otherwise never reach it.
+        const std::uint64_t waited = now - door.start_ms;
+        if (waited >= limit) {
+            result = "timeout";
+            break;
+        }
+        // One try of the request (the heap's own path; operator new's handler is not called by malloc).
+        if (void* block = std::malloc(bytes)) {
+            std::free(block);
+            result = "served";
+            break;
+        }
+        if (jobs == 0 && since_end_ms >= MemoryWait::DoorRecentMs && waited >= new_wait_ms) {
+            result = "jobs-ended";
+            break;
+        }
+    }
+    if (eden_heap_want) eden_heap_want(0);
+    std::fprintf(stderr, "EDEN_DOOR_WAIT end result=%s thread=%s requested=%zu waited_ms=%llu jobs_ended=%llu jobs=%u\n",
+                 result, name[0] ? name : "?", bytes, static_cast<unsigned long long>(now - door.start_ms),
+                 ended - ended_at_start, jobs);
+    if (result[0] == 's') {
+        door.served = true;
+        door.served_ms = now;
+        return 1;
+    }
+    if (result[0] == 't') door.cooldown_until_ms = now + MemoryWait::CooldownMs;
+    return 2;
+}
+#endif
+
+#ifdef PS5_NATIVE
+// T175d: told of every fopen for writing (headless/nfs/nfs.cpp's wrapper); only the core's write of
+// the driver pipeline cache (vulkan_pipelines.bin, written whole as vulkan_pipelines.bin.part and
+// renamed over it by PipelineCache::SerializeVulkanPipelineCache: at the end of LoadDiskResources,
+// in play and at exit) is looked at. The core's sources stay as they are (vk_pipeline_cache.cpp is
+// part of what the shader store's translation id is made of).
+//  - EDEN_UP_BOOT_CACHE_TEXT=1: a write during the start's shader step names its part on the boot
+//    screen ("STORING THE SHADER CACHE" and its seconds) instead of the pass's last figures.
+//  - EDEN_UP_DRIVER_CACHE_SKIP_SAME=1: the write is refused while the driver says the app's
+//    pipeline cache has had no object added or removed since vkCreatePipelineCache read the file
+//    (lead-mesh-44's count is 0; a looked-up entry turned from the file's bytes into its object is
+//    not a change): what would be written is the set of objects the file holds, each from the
+//    file's own bytes, so the file is kept as it is. The core logs that it could not open the .part file and
+//    keeps the previous file (its own handling of a failed open); a later write, once the count is
+//    above 0, goes ahead as before. A driver without the count: always written.
+// Both read once, at the first such write (env.txt and the title's file are in by then).
+extern "C" bool eden_fopen_write_veto(const char* path, const char* mode) {
+    static constexpr std::string_view kPart = "/vulkan_pipelines.bin.part";
+    const std::string_view name{path};
+    if (mode[0] != 'w' || name.size() < kPart.size() || name.substr(name.size() - kPart.size()) != kPart)
+        return false;
+    static const bool boot_text = Common::PeSwitch("EDEN_UP_BOOT_CACHE_TEXT");
+    static const bool skip_same = Common::PeSwitch("EDEN_UP_DRIVER_CACHE_SKIP_SAME");
+    if (boot_text && Eden::Loading::step.load(std::memory_order_relaxed) ==
+                         static_cast<uint32_t>(Eden::Loading::Step::shaders))
+        Eden::Loading::Parts(Eden::Loading::Part::cache, 0, 0);
+    if (!skip_same) return false;
+    const auto changes = eden_radv_pipeline_cache_changes;
+    if (changes == nullptr) {
+        LOG_INFO(Frontend, "EDEN_UP_DRIVER_CACHE_SKIP_SAME: the driver gives no change count; "
+                           "vulkan_pipelines.bin written as before");
+        return false;
+    }
+    const unsigned long long changed = changes();
+    if (changed != 0) {
+        LOG_INFO(Frontend, "EDEN_UP_DRIVER_CACHE_SKIP_SAME: {} changes to the app's pipeline cache since "
+                           "it was read; vulkan_pipelines.bin written as before", changed);
+        return false;
+    }
+    static std::atomic<unsigned> kept{0};
+    LOG_INFO(Frontend, "EDEN_UP_DRIVER_CACHE_SKIP_SAME: vulkan_pipelines.bin kept as it was read "
+                       "(0 changes to the app's pipeline cache), write {} skipped",
+             kept.fetch_add(1, std::memory_order_relaxed) + 1);
+    errno = EEXIST;
+    return true;
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
         std::FILE* report = stdout;
@@ -353,9 +523,19 @@ int main(int argc, char** argv) {
                                   Eden::FileExists(std::string{folder} + "/ui/fonts/montserrat-medium.pefont") ? "yes" : "no");
         Eden::BootTrace::Line("app folder: %s", Eden::AppDir().c_str());
         std::set_new_handler([] {
+            // 0663: an optional request (eden_optional_allocation_scope above) is refused at once.
+            if (optional_allocation_depth != 0) {
+                throw std::bad_alloc{};
+            }
             unsigned reason = 0;
             size_t count = 0;
             const size_t bytes = eden_heap_last_failure(&reason, &count);
+            // EDEN_UP_DOOR_WAIT (0597, DoorWait above): while a builder job is in flight, an allowed
+            // thread waits up to EDEN_UP_DOOR_WAIT_MAX_MS in place of the wait below; served: return
+            // (operator new tries again); ended unserved: refused now, with no second wait. Off: one
+            // relaxed load, then the handler as before.
+            const int door = DoorWait(bytes, Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed));
+            if (door == 1) return;
             // EDEN_UP_NEW_WAIT_MS=<ms> (memory_wait.h; unset or 0: no wait, as before). operator new
             // calls this after each refusal and tries again when it returns, so returning after a
             // 20 ms sleep is the wait: other threads free memory meanwhile (an area's pages and
@@ -366,7 +546,7 @@ int main(int argc, char** argv) {
             // Port: the whole block runs only with the switch on; off, the handler is the old one.
             // Counters for the EDEN_UP_NEW_WAIT line every 10 s (headless/performance.cpp).
             if (const unsigned wait_ms = Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed);
-                wait_ms != 0) {
+                wait_ms != 0 && door == 0) {
                 namespace MemoryWait = Eden::MemoryWait;
                 auto& counters = MemoryWait::counters;
                 thread_local MemoryWait::Episode episode;
@@ -390,12 +570,14 @@ int main(int argc, char** argv) {
                         counters.begun.fetch_add(1, std::memory_order_relaxed);
                         if (was_open && now - last_call <= MemoryWait::SameRequestGapMs)
                             counters.other_size.fetch_add(1, std::memory_order_relaxed);
-                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u\n",
-                                     bytes, reason, limit);
+                        char big[256];  // EDEN_UP_BIG_STACKS: "" when off
+                        if (!eden_big_failure_text || eden_big_failure_text(big, sizeof(big), bytes) == 0) big[0] = '\0';
+                        std::fprintf(stderr, "EDEN_NEW_WAIT start requested=%zu reason=%u limit_ms=%u%s\n",
+                                     bytes, reason, limit, big);
                     }
                     if (MemoryWait::TrimNow(episode, step, now) && eden_heap_trim) {
                         counters.trims.fetch_add(1, std::memory_order_relaxed);
-                        eden_heap_trim();
+                        (void)(eden_heap_trim_unheld ? eden_heap_trim_unheld() : eden_heap_trim());
                     }
                     counters.steps.fetch_add(1, std::memory_order_relaxed);
                     counters.waiting.fetch_add(1, std::memory_order_relaxed);
@@ -434,8 +616,10 @@ int main(int argc, char** argv) {
                     counters.cooldown.fetch_add(1, std::memory_order_relaxed);
                 }
             }
-            std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu\n", bytes,
-                         reason, count);
+            char big[256];  // EDEN_UP_BIG_STACKS: this request's row and who grew the heap; "" when off
+            if (!eden_big_failure_text || eden_big_failure_text(big, sizeof(big), bytes) == 0) big[0] = '\0';
+            std::fprintf(stderr, "EDEN_HEAP_FAILURE requested=%zu reason=%u count=%zu%s\n", bytes,
+                         reason, count, big);
             ps5_opengl_heap_snapshot("allocation_failure", 0);
             std::fflush(stdout);
             Eden::Report("allocation failure", "operator new: heap exhausted");
@@ -478,7 +662,9 @@ int main(int argc, char** argv) {
                     std::rename(before.c_str(), cache.c_str()) != 0)
                     Eden::Report("cache", "The driver's shader cache could not move to the data folder; it starts empty");
                 (void)mkdir(cache.c_str(), 0777);
-                setenv("MESA_SHADER_CACHE_DIR", cache.c_str(), 1);
+                // T175d: a value already in the environment stays (env.txt, read below, sets it
+                // over this one in any case; see EDEN_ENV MESA_SHADER_CACHE_DIR after it).
+                setenv("MESA_SHADER_CACHE_DIR", cache.c_str(), 0);
             }
         }
         // Whether Eden's large tables can be sparse on this console (src/memory_pages.cpp),
@@ -648,6 +834,19 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV_TRIM env.txt: %u of %u lines trimmed (a carriage return, spaces or tabs at "
                             "the end, or spaces before the name)\n", trimmed, lines);
         }
+        // T175d: env.txt may move the driver's shader cache (MESA_SHADER_CACHE_DIR, e.g. to another
+        // disk for a test). The driver makes only its own folder inside it: the folder itself is
+        // made here, and its place said once. Unchanged: nothing is said or made.
+#ifdef PS5_NATIVE
+        if (const char* driver_cache = std::getenv("MESA_SHADER_CACHE_DIR");
+            driver_cache != nullptr && driver_cache[0] != '\0' &&
+            std::string_view{driver_cache} != std::string{Eden::kDataDir} + "/cache/radv") {
+            std::error_code driver_cache_error;
+            std::filesystem::create_directories(driver_cache, driver_cache_error);
+            std::printf("EDEN_ENV MESA_SHADER_CACHE_DIR in use: %s (%s)\n", driver_cache,
+                        Eden::DirectoryExists(driver_cache) ? "folder ready" : "folder missing");
+        }
+#endif
         // EDEN_THREAD_DUMP=1: every named thread's place on a freeze (no frame for 3, 10 and 60 s
         // in a game) or when dump-threads.txt is dropped into the app folder (crash_report.h).
         Eden::Crash::StartThreadDump(Eden::AppFile("dump-threads.txt"), [] {
@@ -656,6 +855,7 @@ int main(int argc, char** argv) {
         // The heap's pool switches (EDEN_BIG_IMAGE_RESERVE_MIB, EDEN_BIG_IMAGE_NO_SPLIT) are read
         // now, with the environment complete and the pool still whole (headless/heap_pages.cpp).
         if (eden_heap_pool_init) eden_heap_pool_init();
+        if (eden_direct_ledger_exact_init) eden_direct_ledger_exact_init();
         // Test runs (test_harness.h): nothing happens here without an EDEN_TEST_ setting.
         Eden::TestHarness::Start();
         if (const std::string& title = Eden::TestHarness::BootTitle(); !title.empty()) {
@@ -937,6 +1137,32 @@ int main(int argc, char** argv) {
             std::printf("EDEN_UP_NEW_WAIT_MS=%u: operator new waits that long for memory before it gives up\n",
                         wait);
         }
+        // EDEN_UP_DOOR_WAIT=1 (0597, memory_wait.h; exact 1): EDEN_UP_DOOR_WAIT_MAX_MS, unset 15000, held
+        // within 1000..30000. The builder job count comes from the core's scope (vk_door_job.h), which
+        // reads the same switch at the first run-time build.
+        if (Common::PeSwitch("EDEN_UP_DOOR_WAIT")) {
+            if (eden_door_jobs && eden_door_may_wait) {
+                Eden::MemoryWait::door_max_ms.store(
+                    Eden::MemoryWait::ReadMs("EDEN_UP_DOOR_WAIT_MAX_MS", Eden::MemoryWait::DoorDefaultMs,
+                                             Eden::MemoryWait::DoorLowMs, Eden::MemoryWait::DoorHighMs),
+                    std::memory_order_relaxed);
+                std::fprintf(stderr, "EDEN_DOOR_WAIT on max_ms=%u recent_ms=%llu threads=FS,CPUCore_*\n",
+                             Eden::MemoryWait::door_max_ms.load(std::memory_order_relaxed),
+                             static_cast<unsigned long long>(Eden::MemoryWait::DoorRecentMs));
+            } else {
+                std::fprintf(stderr, "EDEN_DOOR_WAIT off reason=no_heap_hooks\n");
+            }
+        }
+        // EDEN_UP_BUILD_GIVE_BACK=1 (0598; exact 1): the heap trims when the last builder job in flight
+        // ends (the core's job count reads this switch too, vk_door_job.h).
+        if (Common::PeSwitch("EDEN_UP_BUILD_GIVE_BACK")) {
+            if (eden_door_set_give_back) {
+                eden_door_set_give_back(1);
+                std::fprintf(stderr, "EDEN_BUILD_GIVE_BACK on (empty heap spaces to the pool when the last build job ends)\n");
+            } else {
+                std::fprintf(stderr, "EDEN_BUILD_GIVE_BACK off reason=no_heap_hooks\n");
+            }
+        }
         // T132 EDEN_UP_JIT_COMMIT_RECLAIM (memory_wait.h): 0 until here, so the launcher's JIT (if any)
         // keeps the old wait; above 3 reads as 3.
         Eden::MemoryWait::jit_reclaim_mode.store(Eden::MemoryWait::ReadMs("EDEN_UP_JIT_COMMIT_RECLAIM", 0, 0, 3),
@@ -1059,10 +1285,41 @@ int main(int argc, char** argv) {
 #ifdef PS5_NATIVE
         // A hang kills the process with the log file half written; flush every line so eden_log.txt
         // keeps the last thing the guest did.
-        Settings::values.log_flush_line.SetValue(true);
+        // T175d: EDEN_UP_LOG_FLUSH_MS=<25-5000> (unset or 0: every line, as before): each line was a
+        // write to /data made by the thread that logged it, which waits whenever the disk does (after
+        // the before-play pass, ~1 s). Instead a thread of its own writes the lines out every that
+        // many ms; error lines still go at once (the file backend does that), at exit the backends
+        // are flushed as before, and at a crash the handler's flushing helper writes them out after
+        // stderr and stdout (crash_report.cpp). A kill without a crash loses at most that many ms.
+        const long log_flush_ms = [] {
+            const char* const text = std::getenv("EDEN_UP_LOG_FLUSH_MS");
+            if (text == nullptr || text[0] == '\0') return 0L;
+            const long value = std::clamp(std::strtol(text, nullptr, 10), 0L, 5000L);
+            return value == 0 ? 0L : std::max(value, 25L);
+        }();
+        Settings::values.log_flush_line.SetValue(log_flush_ms == 0);
 #endif
         Common::Log::Start();
         SCOPE_EXIT { Common::Log::Stop(); };
+#ifdef PS5_NATIVE
+        // T175d: stopped (and joined) before the SCOPE_EXIT above flushes for the last time.
+        std::jthread log_timed_flush;
+        if (log_flush_ms != 0) {
+            Eden::Crash::SetExtraFlush([] { Common::Log::Stop(); });
+            log_timed_flush = std::jthread([log_flush_ms](std::stop_token stop) {
+                Eden::Crash::NameThread("LogFlushEden");
+                std::mutex wait_mutex;
+                std::condition_variable_any wake;
+                std::unique_lock wait_lock{wait_mutex};
+                while (!stop.stop_requested()) {
+                    wake.wait_for(wait_lock, stop, std::chrono::milliseconds(log_flush_ms), [] { return false; });
+                    Common::Log::Stop(); // writes the backends out; logging goes on
+                }
+            });
+            LOG_INFO(Frontend, "EDEN_UP_LOG_FLUSH_MS={}: eden_log.txt written out every {} ms, not at every line",
+                     log_flush_ms, log_flush_ms);
+        }
+#endif
         #ifdef EDEN_PS5_OPENGL
         Settings::values.renderer_backend = backend == Eden::GraphicsBackend::Vulkan ?
             Settings::RendererBackend::Vulkan : Settings::RendererBackend::OpenGL_GLSL;
@@ -1079,6 +1336,22 @@ int main(int argc, char** argv) {
             present_thread != nullptr && present_thread[0] == '1') {
             Settings::values.async_presentation = backend == Eden::GraphicsBackend::Vulkan;
         }
+        // 0752 (master list X20, skolvolt/Lichii c0b50af): EDEN_NX2_IDLE_SPIN_US=<0-10000>, the
+        // microseconds a guest core spins on its interrupt flag before it sleeps. The core reads
+        // this name in PhysicalCore::Idle, but CMakeLists.txt replaces that function with ours
+        // (performance.h idle_spin_iterations), so until now the name did nothing here. Unset,
+        // or not a plain number up to 10000: the default 100 us stays. 0 sleeps at once.
+        // dev-settings idle_spin_us (development builds) still wins over it.
+        if (const char* const spin = std::getenv("EDEN_NX2_IDLE_SPIN_US");
+            spin != nullptr && spin[0] >= '0' && spin[0] <= '9') {
+            char* end = nullptr;
+            const unsigned long us = std::strtoul(spin, &end, 10);
+            if (*end == '\0' && us <= 10000) {
+                Eden::Performance::idle_spin_iterations = static_cast<unsigned>(us * 50);
+                std::fprintf(stderr, "EDEN_NX2_IDLE_SPIN_US=%lu: guest cores spin %u pauses before sleeping\n",
+                             us, static_cast<unsigned>(us * 50));
+            }
+        }
 #ifdef EDEN_DEV_VULKAN
         Settings::values.async_presentation = backend == Eden::GraphicsBackend::Vulkan;
         // Exercise upstream's checked initialization error, never an invalid pointer.
@@ -1091,6 +1364,38 @@ int main(int argc, char** argv) {
         // every frame (20-25 FPS). Eden's larger integrated budget (6 GiB) holds it at 30 FPS
         // with ~0.9 GB of direct memory to spare.
         Settings::values.vram_usage_mode.SetValue(Settings::VramUsageMode::Aggressive);
+        // 0820 EDEN_UP_VRAM_MODE=conservative|aggressive (env.txt, exact word; unset or anything
+        // else: Aggressive as above, nothing else changes). Upstream's recommended Ocarina settings
+        // (Eglantine-Community nx2, game_presets.h) use Conservative. On this integrated device it
+        // gives the caches a 4 GiB device figure instead of 6 GiB (Device::CollectPhysicalMemoryInfo),
+        // which moves the texture collector's floor (minimum_memory, (figure - 4 GiB) / 2) from
+        // 1024 MiB to 0: the collector, and with it the pool signal (PoolPressure), then runs
+        // whatever the images add up to. Its marks stay where EDEN_NX2_TC_EXPECTED_MIB /
+        // _CRITICAL_MIB put them; without those they come down too. The budget the texture cache
+        // follows (Device::GetDeviceMemoryBudget, capped at the figure) drops to 4 GiB as well; the
+        // env marks still win over it. The buffer cache does not move: on a Switch 2 title it
+        // collects by its own size (EDEN_NX2_BC_COLLECT_MIB), not by the device figure.
+        // With the floor at 0 the collector runs every frame, so EDEN_UP_TC_SHORT_COLLECT (0730,
+        // which acts only under the floor) never acts: the collector's own rules replace it, and
+        // in the field (largest free block 150 to 370 MiB) those are its strong ones (images
+        // unused 25 frames, 10 under 256 MiB, CostlyLoad ones too): watch for re-uploads and for
+        // the 20-25 FPS the comment above names (whether that was with the env marks: not checked).
+        // Read before the device is made; dev-settings vram= (development builds) still wins after
+        // it. Not a translation switch: no shader store stamp change.
+        if (const char* const vram_mode = std::getenv("EDEN_UP_VRAM_MODE")) {
+            const std::string_view mode{vram_mode};
+            if (mode == "conservative" || mode == "aggressive") {
+                const bool conservative = mode == "conservative";
+                Settings::values.vram_usage_mode.SetValue(conservative ? Settings::VramUsageMode::Conservative
+                                                                       : Settings::VramUsageMode::Aggressive);
+                std::fprintf(stderr, "EDEN_UP_VRAM_MODE=%s: vram_usage_mode %s\n", vram_mode,
+                             conservative ? "Conservative" : "Aggressive");
+            } else {
+                // A misspelt value (e.g. "Conservative") would otherwise pass unseen.
+                std::fprintf(stderr, "EDEN_UP_VRAM_MODE=%s: not conservative or aggressive, ignored "
+                             "(vram_usage_mode Aggressive)\n", vram_mode);
+            }
+        }
 #else
         Settings::values.renderer_backend = Settings::RendererBackend::Null;
 #endif
@@ -1654,6 +1959,8 @@ int main(int argc, char** argv) {
                     completion->wake.notify_one();
                 });
                 SCOPE_EXIT {
+                    // 0841: a held background shader set thread goes on (and sees the stop) first.
+                    Eden::Performance::ReleaseBackgroundHold();
                     if (system.IsPoweredOn()) system.ShutdownMainProcess();
                     system.RegisterExitCallback({});
                 };
@@ -1757,6 +2064,8 @@ int main(int argc, char** argv) {
                 Eden::BootTrace::Line("game loaded (status %u)", static_cast<unsigned>(loaded));
                 Eden::Report("loader", "Game loaded; initializing renderer");
                 Eden::Loading::Set(Eden::Loading::Step::graphics);
+                // 0840: a new session; its before-play pass may widen its threads until the guest starts.
+                Eden::Performance::NoteSessionStart();
 #ifdef EDEN_PS5_OPENGL
                 // Retain the failure, then release CPU readiness and complete normal
                 // shutdown before reporting it. Unwinding before OnGpuReady can hang.
@@ -1792,6 +2101,11 @@ int main(int argc, char** argv) {
                     // every five seconds so a slow build can be told apart from a stalled one.
                     std::atomic<size_t> built{0}, total{0};
                     std::atomic<bool> counted{false};
+                    std::atomic<bool> preparing{false}; // EDEN_UP_SHADER_SET_PREPASS (core 0770)
+                    // Core 0833: the part of the before-play pass running now (0: none), its count.
+                    std::atomic<unsigned> part{0};
+                    std::atomic<size_t> part_done{0}, part_total{0};
+                    Eden::Loading::prepass.store(Common::PeSwitch("EDEN_UP_SHADER_SET_PREPASS") ? 1 : 0);
                     Eden::Loading::Set(Eden::Loading::Step::shaders);
                     const auto load_start = std::chrono::steady_clock::now();
                     std::jthread reporter([&](std::stop_token stop) {
@@ -1801,7 +2115,18 @@ int main(int argc, char** argv) {
                         for (unsigned tick = 1; !stop.stop_requested(); ++tick) {
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
                             if (tick % 50 != 0 || stop.stop_requested()) continue;
-                            const std::string line = counted
+                            static constexpr const char* kPartWords[] = {
+                                "", "reading the game's shader files", "making the shader list",
+                                "saving the shader list", "checking the shader list"};
+                            const unsigned part_now = part.load();
+                            const std::string line = preparing
+                                ? fmt::format("Shader set: {} of {} records prepared before play ({} s)",
+                                              built.load(), total.load(), tick / 10)
+                                : part_now != 0 && part_now < 5
+                                ? fmt::format("Shader set before play: {}, {} of {} ({} s)",
+                                              kPartWords[part_now], part_done.load(), part_total.load(),
+                                              tick / 10)
+                                : counted
                                 ? fmt::format("Shader cache: {} of {} pipelines built ({} s)",
                                               built.load(), total.load(), tick / 10)
                                 : fmt::format("Shader cache: reading ({} s)", tick / 10);
@@ -1811,9 +2136,44 @@ int main(int argc, char** argv) {
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
                     Eden::Stall::Trace("main cache_load");
 #endif
+                    // Core 0833: with the before-play pass, making the shader list tells the boot
+                    // screen how far its slow parts are (reading the game's shader files, making
+                    // the list, saving it), through ShaderSet's hook, set only around this call
+                    // and cleared when it returns or throws (no core file the shader store's
+                    // translation id is made of changes). Pass off: no hook, as before.
+                    struct BootProgressHook {
+                        explicit BootProgressHook(bool on, VideoCommon::ShaderSet::OnProgress hook) : set{on} {
+                            if (set) VideoCommon::ShaderSet::SetBootProgress(std::move(hook));
+                        }
+                        ~BootProgressHook() {
+                            if (set) VideoCommon::ShaderSet::SetBootProgress({});
+                        }
+                        const bool set;
+                    } boot_progress_hook{
+                        Eden::Loading::prepass.load() != 0,
+                        [&](VideoCommon::ShaderSet::Part set_part, u64 value, u64 count) {
+                            using SetPart = VideoCommon::ShaderSet::Part;
+                            const auto now_at = set_part == SetPart::Files     ? Eden::Loading::Part::files
+                                                : set_part == SetPart::Records ? Eden::Loading::Part::records
+                                                                               : Eden::Loading::Part::save;
+                            part_done = static_cast<size_t>(value);
+                            part_total = static_cast<size_t>(count);
+                            part = static_cast<unsigned>(now_at);
+                            Eden::Loading::Parts(now_at, static_cast<size_t>(value), static_cast<size_t>(count));
+                        }};
                     system.Renderer().ReadRasterizer()->LoadDiskResources(
                         system.GetApplicationProcessProgramID(), std::stop_token{},
                         [&](VideoCore::LoadCallbackStage stage, size_t value, size_t count) {
+                            if (stage == VideoCore::LoadCallbackStage::Prepare) {
+                                // EDEN_UP_SHADER_SET_PREPASS (core 0770): the shader set's
+                                // records prepared before the game starts, from its threads.
+                                preparing = true;
+                                built = value;
+                                total = count;
+                                counted = true;
+                                Eden::Loading::Prepared(value, count);
+                                return;
+                            }
                             if (stage != VideoCore::LoadCallbackStage::Build) return;
                             built = value;
                             Eden::Loading::Shaders(value, count);
@@ -1825,10 +2185,74 @@ int main(int argc, char** argv) {
                         });
                     reporter.request_stop();
                     reporter.join();
+                    // T175b, RADV_PS5_LONGLIVED_ARENA (0 or 1): the boot pipelines are built; how much
+                    // of the heap is slack, and what a trim gives back, with and without the long-lived
+                    // set. Unset: the call returns at once (no trim, no line), as T173.
+                    if (eden_heap_long_lived_report) eden_heap_long_lived_report("boot");
+                    // 0844, EDEN_UP_PREPASS_CACHE_WAIT_S=<s> (unset or 0: no wait), with the before-play
+                    // pass only: up to 256 MB of the driver's disk cache writes can still be queued
+                    // in memory when the pass ends; wait (bounded) until the driver says none is,
+                    // before the guest starts. Only a driver that offers the count can be waited for.
+                    if (Eden::Loading::prepass.load() != 0) {
+                        const char* const cache_wait_text = std::getenv("EDEN_UP_PREPASS_CACHE_WAIT_S");
+                        const long cache_wait_s = cache_wait_text != nullptr && cache_wait_text[0] != '\0'
+                                                ? std::clamp(std::strtol(cache_wait_text, nullptr, 10), 0L, 3600L)
+                                                : 0L;  // T166 review: off unless asked (it was 120)
+                        const auto cache_queued = eden_radv_disk_cache_queued;
+                        // T172: the driver's drain (lead-mesh-35/41, RADV_PS5_CACHE_FAST=1) writes
+                        // the index entries its database parts hold back once the queue is empty.
+                        const auto cache_drain = eden_radv_disk_cache_drain;
+                        if (cache_wait_s != 0 && cache_queued == nullptr) {
+                            LOG_INFO(Frontend, "EDEN_UP_PREPASS_CACHE_WAIT_S: this driver does not say how "
+                                     "many disk cache writes are queued (it counts with RADV_PS5_CACHE_FAST=1, "
+                                     "RADV_PS5_DISK_CACHE_STATS=1 or RADV_PS5_DISK_CACHE_DRAIN_EXIT); not waited for");
+                        } else if (cache_wait_s != 0) {
+                            // T175d, EDEN_UP_BOOT_CACHE_TEXT=1: the screen names the wait
+                            // ("STORING THE SHADER CACHE" and its seconds).
+                            if (Common::PeSwitch("EDEN_UP_BOOT_CACHE_TEXT"))
+                                Eden::Loading::Parts(Eden::Loading::Part::cache, 0, 0);
+                            const auto cache_wait_start = std::chrono::steady_clock::now();
+                            const unsigned long long cache_first = cache_queued();
+                            unsigned long long cache_left = cache_first;
+                            auto cache_told = cache_wait_start;
+                            while (cache_left != 0 && std::chrono::steady_clock::now() - cache_wait_start <
+                                                    std::chrono::seconds{cache_wait_s}) {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(250));
+                                cache_left = cache_queued();
+                                if (std::chrono::steady_clock::now() - cache_told >= std::chrono::seconds{5}) {
+                                    cache_told = std::chrono::steady_clock::now();
+                                    Eden::Report("loader", fmt::format("Driver shader cache: {} writes still "
+                                                 "queued ({} at the start)", cache_left, cache_first).c_str());
+                                }
+                            }
+                            LOG_INFO(Frontend, "EDEN_UP_PREPASS_CACHE_WAIT_S: {} driver disk cache writes "
+                                     "queued after the pass, {} left after {} ms (limit {} s)",
+                                     cache_first, cache_left,
+                                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - cache_wait_start).count(),
+                                     cache_wait_s);
+                            if (cache_drain != nullptr) {
+                                // What is left of the limit (0: no wait, the held-back entries are
+                                // still written). The driver prints its own "RADV_PS5_CACHE drain:" line.
+                                const long long cache_spent_ms =
+                                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - cache_wait_start).count();
+                                const unsigned cache_rest_ms = static_cast<unsigned>(
+                                    std::clamp(cache_wait_s * 1000LL - cache_spent_ms, 0LL, 3600000LL));
+                                const bool cache_drained = cache_drain(cache_rest_ms);
+                                LOG_INFO(Frontend, "EDEN_UP_PREPASS_CACHE_WAIT_S: driver drain {} (limit {} ms), "
+                                         "{} ms in all", cache_drained ? "done" : "not done", cache_rest_ms,
+                                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::steady_clock::now() - cache_wait_start).count());
+                            }
+                        }
+                    }
                     const auto load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - load_start).count();
-                    Eden::Report("loader", fmt::format("Shader cache ready: {} pipelines in {} ms",
-                                                       total.load(), load_ms).c_str());
+                    Eden::Report("loader", (preparing
+                        ? fmt::format("Shader cache ready, shader set prepass: {} of {} records in {} ms",
+                                      built.load(), total.load(), load_ms)
+                        : fmt::format("Shader cache ready: {} pipelines in {} ms", total.load(), load_ms)).c_str());
                     std::puts("EDEN_SHADER_CACHE_LOADED");
                     std::fflush(stdout);
                 }
@@ -1904,6 +2328,8 @@ int main(int argc, char** argv) {
                     auto* const process = running->ApplicationProcess();
                     return process ? process->GetUsedUserPhysicalMemorySize(running->Kernel()) : 0;
                 });
+                // 0840: from here no ShaderSetPrepass thread is given every CPU (EDEN_UP_PREPASS_ALL_CORES).
+                Eden::Performance::NoteGuestStart();
                 system.Run();
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
                 Eden::Stall::Trace("main running");
@@ -2333,6 +2759,7 @@ int main(int argc, char** argv) {
                     for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
 #endif
+                Eden::Performance::ReleaseBackgroundHold();  // 0841, as in the SCOPE_EXIT above
                 system.ShutdownMainProcess();
                 Eden::Report("shutdown", "Game stopped; releasing renderer");
 #ifndef PS5_NATIVE

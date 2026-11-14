@@ -35,6 +35,7 @@
 #ifdef PS5_NATIVE
 #include <sys/param.h>
 #include <sys/cpuset.h>
+#include <pthread_np.h>  // pthread_getthreadid_np (0840, T166 review)
 #endif
 
 // dynarmic A64 dispatch-path counters (headless/dynarmic/jit_group_support.inc).
@@ -50,6 +51,13 @@ void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 #ifdef PS5_NATIVE
 #include "mkw_native_sample.inc"
 #endif
+
+// 0844 (performance.h): null until a driver that offers the count sets it (lead-mesh-41).
+extern "C" unsigned long long (*eden_radv_disk_cache_queued)(void) = nullptr;
+// 0844 (T172, performance.h): null until the driver sets its drain (lead-mesh-41).
+extern "C" bool (*eden_radv_disk_cache_drain)(unsigned timeout_ms) = nullptr;
+// T175d (performance.h): null until the driver makes a pipeline cache (lead-mesh-44).
+extern "C" unsigned long long (*eden_radv_pipeline_cache_changes)(void) = nullptr;
 
 namespace Eden::Performance {
 namespace {
@@ -295,9 +303,91 @@ unsigned long long PlacementOverride(const char* name) {
     }
     return 0;
 }
+// 0840, EDEN_UP_PREPASS_ALL_CORES=1 (off by default; T166 review: it was on unless "0", which
+// changed every start with EDEN_UP_SHADER_SET_PREPASS=1; only with that switch): the
+// before-play pass's threads (ShaderSetPrepass: its pool and its reporter) get every CPU the
+// process is allowed instead of the shared mask, when they are made before the guest starts. In
+// run1387 (T162, 13 Nov) its 8 workers shared CPUs 7, 9, 10, 11, 12 while the guest cores (0-5),
+// the GPU threads' CPUs (6, 8) were idle: no guest code runs before EDEN_GUEST_START, so the
+// guest cores' threads wait, the GPU thread has no guest work, and the boot pipelines are built
+// before the pass. The pool is made at the start of the pass and joined at its end, so its
+// threads end with the pass. T166 review: 0786 keeps a pool whose builds never returned to the end
+// of the session, and those threads (a build that does not return is still running) would keep
+// every CPU, the guest cores included. So each widened thread's id is noted, and NoteGuestStart
+// puts every one still noted back on the shared mask. A thread that ends is not seen ending, so
+// its id stays noted; a later thread that gets the same id is named through RegisterWorker,
+// which forgets the id first (ForgetPrepassThread). An unnamed thread that gets a reused id is
+// put on the shared mask, which is where unplaced threads are anyway. An EDEN_PS5_PLACE entry for
+// ShaderSetPrepass wins.
+std::atomic<bool> guest_started{false};
+std::atomic<unsigned> prepass_widened{0};
+std::atomic<unsigned long long> prepass_mask{0};
+std::mutex prepass_threads_mutex;     // guest_started's change, prepass_threads
+std::vector<int> prepass_threads;     // ids of widened threads (pthread_getthreadid_np)
+std::atomic<bool> prepass_threads_any{false};
+void ForgetPrepassThread() {
+#ifdef PS5_NATIVE
+    if (!prepass_threads_any.load(std::memory_order_relaxed)) return;
+    const int self = pthread_getthreadid_np();
+    std::scoped_lock lock{prepass_threads_mutex};
+    std::erase(prepass_threads, self);
+#endif
+}
+unsigned long long AllowedCpus() {
+    if (!topology_allowed_valid) return 0;
+    unsigned long long mask = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (CPU_ISSET(cpu, &topology_allowed)) mask |= 1ULL << cpu;
+    return mask;
+}
+unsigned long long PrepassAllCores(const char* name) {
+    if (std::strncmp(name, "ShaderSetPrepass", 16) != 0 || guest_started.load(std::memory_order_relaxed) ||
+        !Common::PeSwitch("EDEN_UP_SHADER_SET_PREPASS") || !Common::PeSwitch("EDEN_UP_PREPASS_ALL_CORES"))
+        return 0;
+    const unsigned long long cpus = AllowedCpus();
+    if (cpus == 0) return 0;
+#ifdef PS5_NATIVE
+    {
+        // Under the lock NoteGuestStart sets guest_started with: a thread is either noted before
+        // the narrowing or not widened at all.
+        std::scoped_lock lock{prepass_threads_mutex};
+        if (guest_started.load(std::memory_order_relaxed)) return 0;
+        prepass_threads.push_back(pthread_getthreadid_np());
+        prepass_threads_any.store(true, std::memory_order_relaxed);
+    }
+#endif
+    prepass_widened.fetch_add(1, std::memory_order_relaxed);
+    prepass_mask.store(cpus, std::memory_order_relaxed);
+    return cpus;
+}
+// 0842, EDEN_UP_AV1_ALL_CORES=1 (off by default): the movie decoder's thread (nx2:vdec, core
+// nx2_gsv.h DecodeLoop) gets every allowed CPU but the GPU threads' (GPU, GPUBack, VulkanWorker and
+// EDEN_UP_GPU_PIN_EXCLUSIVE's cores). FFmpeg's libdav1d makes its EDEN_NX2_AV1_THREADS worker
+// threads from that thread when it opens a stream (ffmpeg.cpp OpenContext); they are not named
+// through this hook and take the CPU set of the thread that made them, so today they share the
+// 5-CPU shared mask with everything else that is not placed (the title movie: 18-58 fps across the
+// 13 Nov sessions). During the title movie the guest cores' own work is light; during a cutscene
+// movie in play the decoder then competes with the guest cores (not measured). The late-dropped
+// count is the core's existing line ("nx2:vdecsvc frame N ... K late dropped", every 600 frames and
+// at the end of a stream, EDEN_UP_MOVIE_PACE=1). An EDEN_PS5_PLACE entry for nx2:vdec wins.
+unsigned long long Av1AllCores(const char* name) {
+    if (std::strcmp(name, "nx2:vdec") != 0 || !Common::PeSwitch("EDEN_UP_AV1_ALL_CORES")) return 0;
+    const unsigned long long allowed = AllowedCpus();
+    unsigned long long gpu = exclusive_gpu.load(std::memory_order_relaxed) | PlacementOverride("GPU") |
+                             PlacementOverride("GPUBack") | PlacementOverride("VulkanWorker");
+    // The GPU thread's own CPU: its EDEN_PS5_PLACE entry's lowest (as PinWorker), else its pin.
+    if (PlacementOverride("GPU") == 0 && worker_topology_ready) gpu |= 1ULL << worker_cpus[4];  // names[4]
+    unsigned long long cpus = allowed & ~gpu;
+    if (cpus == 0) cpus = allowed;
+    std::printf("EDEN_UP_AV1_ALL_CORES: nx2:vdec and the AV1 decoder threads it starts run on mask %llx "
+                "(shared mask %llx, GPU threads' CPUs %llx left out)\n", cpus, SharedCpus(), gpu & allowed);
+    return cpus;
+}
 void PlaceSecondary(const char* name) {
     unsigned long long cpus = PlacementOverride(name);
     const unsigned long long gpu = exclusive_gpu.load(std::memory_order_relaxed);
+    if (cpus == 0 && placement_secondary.load(std::memory_order_relaxed)) cpus = PrepassAllCores(name);
+    if (cpus == 0 && placement_secondary.load(std::memory_order_relaxed)) cpus = Av1AllCores(name);
     if (cpus == 0) {
         if (!placement_secondary.load(std::memory_order_relaxed) || !SharedCpus()) return;
         cpus = SharedCpus();
@@ -624,6 +714,79 @@ void SetSecondaryPlacement(bool enabled) {
 #endif
 }
 
+namespace {
+// 0841 (HoldBackgroundPass, below): released at the session's end; when the guest started.
+std::mutex hold_mutex;
+std::condition_variable hold_wake;
+bool hold_released = false;
+std::optional<std::chrono::steady_clock::time_point> hold_guest_start;
+} // namespace
+
+void NoteSessionStart() {
+    {
+        std::scoped_lock lock{hold_mutex};
+        hold_released = false;
+        hold_guest_start.reset();
+    }
+#ifdef PS5_NATIVE
+    {
+        std::scoped_lock lock{prepass_threads_mutex};
+        guest_started.store(false, std::memory_order_relaxed);
+        prepass_threads.clear();
+        prepass_threads_any.store(false, std::memory_order_relaxed);
+    }
+    prepass_widened.store(0, std::memory_order_relaxed);
+    prepass_mask.store(0, std::memory_order_relaxed);
+#endif
+}
+
+void NoteGuestStart() {
+    {
+        std::scoped_lock lock{hold_mutex};
+        hold_guest_start = std::chrono::steady_clock::now();
+    }
+    hold_wake.notify_all();
+#ifdef PS5_NATIVE
+    std::vector<int> narrow;
+    {
+        std::scoped_lock lock{prepass_threads_mutex};
+        guest_started.store(true, std::memory_order_relaxed);
+        narrow.swap(prepass_threads);
+        prepass_threads_any.store(false, std::memory_order_relaxed);
+    }
+    // T166 review: threads still noted (a pool 0786 kept, with a build that did not return) go
+    // back on the shared mask, as PlaceSecondary would have placed them. A thread that has ended
+    // answers ESRCH and is counted as gone.
+    unsigned narrowed = 0, gone = 0, failed = 0;
+    int first_error = 0;
+    if (!narrow.empty()) {
+        unsigned long long cpus = SharedCpus();
+        const unsigned long long gpu = exclusive_gpu.load(std::memory_order_relaxed);
+        if (gpu != 0 && (cpus & ~gpu) != 0) cpus &= ~gpu;
+        cpuset_t mask{};
+        for (unsigned cpu = 0; cpu < 64; ++cpu)
+            if (cpus & (1ULL << cpu)) CPU_SET(cpu, &mask);
+        for (const int id : narrow) {
+            if (cpus == 0) break;
+            if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, id, 8, &mask) == 0) {
+                ++narrowed;
+            } else if (errno == ESRCH) {
+                ++gone;
+            } else {
+                ++failed;
+                if (first_error == 0) first_error = errno;
+            }
+        }
+    }
+    if (const unsigned widened = prepass_widened.load(std::memory_order_relaxed); widened != 0)
+        std::printf("EDEN_UP_PREPASS_ALL_CORES: %u ShaderSetPrepass threads ran on mask %llx before the "
+                    "game started (shared mask %llx); none is widened from here; %u still running put "
+                    "back on the shared mask, %u ended, %u refused (error %d)\n",
+                    widened, prepass_mask.load(std::memory_order_relaxed), SharedCpus(), narrowed, gone,
+                    failed, first_error);
+#endif
+}
+
 void SampleGpuFrame(unsigned frame) {
     std::printf("EDEN_PERF_GPU_FRAME frame=%u mono_ns=%lld cpu_ns=%lld\n", frame,
                 ClockNs(CLOCK_MONOTONIC),
@@ -635,6 +798,10 @@ extern "C" unsigned eden_heap_arenas_created(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_committed(void) __attribute__((weak));
 extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((weak));
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
+// EDEN_UP_HEAP_HOLD_AT_LOAD (headless/heap_arenas.inc, t174a): the spare again while the pool has room,
+// and the counts for its line.
+extern "C" void eden_heap_hold_refill(unsigned long long largest_free) __attribute__((weak));
+extern "C" int eden_heap_hold_stats(unsigned long long* values, unsigned count) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
 extern "C" void eden_heap_page_usage(std::size_t* free_pages, std::size_t* idle_arenas, std::size_t* live)
@@ -684,6 +851,10 @@ extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemo
 extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
 extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks,
                                     unsigned long long* hits, unsigned long long* fallbacks) __attribute__((weak));
+// EDEN_POOL_LEDGER_EXACT=1 (src/direct_memory.c): 0 when off.
+extern "C" int eden_direct_ledger_exact(unsigned long long* pieces, unsigned long long* unmatched,
+                                        unsigned long long* unmatched_bytes,
+                                        unsigned long long* untracked) __attribute__((weak));
 // EDEN_UP_SHADER_SET (video_core/shader_set.cpp, FreeMemoryBytes): the free memory its extraction
 // and preparation stop below. This kernel has no vm.stats sysctl counters; the largest free block
 // of the pool is what the caches here go by too (RefreshFreeMemory). 0: not known.
@@ -722,6 +893,13 @@ static void ReportLedger() {
                  bytes[0] >> 20, blocks[0], bytes[1] >> 20, blocks[1], bytes[2] >> 20, blocks[2], bytes[3] >> 20, blocks[3],
                  guest >> 20, reserve >> 20, (eden_heap_committed ? eden_heap_committed() : std::size_t{0}) >> 20,
                  code >> 20, tables >> 20, known ? static_cast<long long>(flexible >> 20) : -1LL, hits, fallbacks);
+    // EDEN_POOL_LEDGER_EXACT=1: the counts above took each release off the block it came from. A
+    // line of its own, so readers of the line above keep working.
+    unsigned long long pieces = 0, unmatched = 0, unmatched_bytes = 0, untracked = 0;
+    if (eden_direct_ledger_exact && eden_direct_ledger_exact(&pieces, &unmatched, &unmatched_bytes, &untracked)) {
+        std::fprintf(stderr, "EDEN_POOL_LEDGER_EXACT pieces=%llu unmatched=%llu (%llu MiB) untracked=%llu\n", pieces,
+                     unmatched, unmatched_bytes >> 20, untracked);
+    }
     // RADV_PS5_MEMORY_REPORT=1: out of the pool, less the owners above, less this, is the driver's
     // own buffers and the rest, every 20 s and not only at a refusal. Without it nothing here runs:
     // this is on the GPU thread, and the question below can refresh the allocator's budget.
@@ -905,6 +1083,29 @@ static void ReportRadvOomLend(long long now, long long lend) {
                  radv_oom_covered.load(std::memory_order_relaxed), radv_oom_short.load(std::memory_order_relaxed),
                  radv_oom_lent.load(std::memory_order_relaxed) >> 20, guest[0], guest[2], guest[3], guest[4], guest[5],
                  guest[6], guest[7], guest[8], guest[9], guest[10] * 2);
+}
+// EDEN_UP_HEAP_HOLD_AT_LOAD (heap_arenas.inc): from RefreshFreeMemory while it is on, every 10 s when a
+// count moved or a hold runs. holds = holds begun (an area change: the texture cache's AreaEvict
+// window); left = seconds the one running has left; trims kept = give-backs it refused; spare = MiB held
+// ready now; taken = spares committed (MiB); refused = takes the pool said no to; served = growths the
+// pool refused and the spare made (bytes asked by the requests that grew), of them in a hold.
+static void ReportHeapHold(long long now) {
+    static std::atomic<long long> reported_ns{0};
+    static std::atomic<unsigned long long> reported_sum{0};
+    long long last = reported_ns.load(std::memory_order_relaxed);
+    if (last != 0 && now - last < 10'000'000'000) return;
+    unsigned long long v[14] = {};
+    if (eden_heap_hold_stats(v, 14) == 0) return;
+    const unsigned long long sum = v[2] + v[3] + v[4] + v[5] + v[7] + v[8] + v[12] + v[13];
+    if (last != 0 && sum == reported_sum.load(std::memory_order_relaxed) && v[1] == 0) return;
+    if (!reported_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    reported_sum.store(sum, std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "EDEN_UP_HEAP_HOLD %llu s: holds %llu (%llu begun by an area burst, the rest by a driver "
+                 "refusal; running now: %llu s left), trims kept %llu; spare %llu MiB ready, taken %llu (%llu MiB), "
+                 "refused by the pool %llu; served %llu growths the pool refused (%llu KiB asked), %llu of them "
+                 "in a hold; capped at 3 x %llu s %llu; trims let through in a hold (game, JIT, operator new) %llu\n",
+                 v[0], v[2], v[11], v[1], v[3], v[4], v[5], v[6], v[7], v[8], v[9] >> 10, v[10], v[0], v[12], v[13]);
 }
 // EDEN_UP_NEW_WAIT_MS (headless/memory_wait.h, main.cpp's new handler): from RefreshFreeMemory (every
 // 100 ms at most, on the GPU thread) while it is on. Its counters every 10 s, when one has moved. While
@@ -1119,6 +1320,11 @@ static void RefreshFreeMemory() {
         if (const int steal = eden_heap_steal_mode_now(); steal != 0) ReportHeapSteal(now, steal);
     // EDEN_UP_NEW_WAIT_MS: the new handler's waits, every 10 s while it is on.
     if (Eden::MemoryWait::new_wait_ms.load(std::memory_order_relaxed) != 0) ReportNewWait(now);
+    // EDEN_UP_HEAP_HOLD_AT_LOAD: the spare again when the pool has room (both return at once when off).
+    if (eden_heap_hold_stats) {
+        if (known && eden_heap_hold_refill) eden_heap_hold_refill(largest);
+        ReportHeapHold(now);
+    }
     // EDEN_UP_JIT_COMMIT_AHEAD / EDEN_TEST_JIT_COMMIT_REFUSE: their counters every 10 s while either is set.
     if (eden_jit_ahead_active && eden_jit_ahead_stats && eden_jit_ahead_active() != 0) ReportJitAhead(now);
     // EDEN_UP_JIT_COMMIT_RECLAIM: the JIT code cache's waits, every 10 s while it is on.
@@ -1562,8 +1768,79 @@ void ReportGpuThread(unsigned frame) {
     Snapshot();
 }
 
+namespace {
+// 0841: the background pass beside the game (the core's StartShaderSet, its thread named
+// "ShaderSet": 1 build in flight, duty 50%, cap 5000) is held while the game starts up and the
+// title movie plays, when EDEN_UP_SHADER_SET_PREPASS=1. In run1387 (T162, 13 Nov), after a pass
+// that ended at its time limit, it ran beside the start-up: 2-3 minutes to the first picture
+// instead of under one, and about 18 fps in the title movie. The thread waits here, at its first
+// line, before it has read or built anything; nothing waits for it but the cache's destructor,
+// which main.cpp releases first (ReleaseBackgroundHold). EDEN_UP_PREPASS_BACKGROUND_AFTER_S: the
+// seconds after the guest starts that it waits (unset: 0 since the T166 review; 600 was the
+// writer's default, not tried); 0: no wait (as before); "never": it
+// stays off for the session.
+// (Its state is above NoteSessionStart.)
+
+long long BackgroundAfterSeconds() {
+    if (!Common::PeSwitch("EDEN_UP_SHADER_SET_PREPASS")) return 0;
+    // T166 review: unset is 0 (no wait, as before 0841): the hold is new behaviour, so it is asked
+    // for (it was 600 by default with the prepass on). A value that is not a number of seconds or
+    // "never" is said and taken as 0, so a typo never keeps the pass off.
+    const char* const value = std::getenv("EDEN_UP_PREPASS_BACKGROUND_AFTER_S");
+    if (value == nullptr || value[0] == '\0') return 0;
+    if (std::strcmp(value, "never") == 0) return -1;
+    char* end = nullptr;
+    const long long seconds = std::strtoll(value, &end, 10);
+    if (end == value || *end != '\0' || seconds < 0) {
+        std::printf("EDEN_UP_PREPASS_BACKGROUND_AFTER_S=%s is not a number of seconds or \"never\"; "
+                    "ignored (no wait)\n", value);
+        return 0;
+    }
+    return std::min<long long>(seconds, 24LL * 3600);
+}
+
+void HoldBackgroundPass() {
+    const long long after = BackgroundAfterSeconds();
+    if (after == 0) return;
+    const auto began = std::chrono::steady_clock::now();
+    if (after > 0)
+        std::printf("EDEN_UP_PREPASS_BACKGROUND_AFTER_S: the background shader set pass waits until %lld s "
+                    "after the game starts\n", after);
+    else
+        std::printf("EDEN_UP_PREPASS_BACKGROUND_AFTER_S=never: the background shader set pass stays off this "
+                    "session\n");
+    std::fflush(stdout);
+    const char* why = "released at the session's end";
+    {
+        std::unique_lock lock{hold_mutex};
+        while (!hold_released) {
+            if (after > 0 && hold_guest_start &&
+                std::chrono::steady_clock::now() >= *hold_guest_start + std::chrono::seconds{after}) {
+                why = "its time came";
+                break;
+            }
+            hold_wake.wait_for(lock, std::chrono::seconds{1});
+        }
+    }
+    const auto waited = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - began);
+    std::printf("EDEN_UP_PREPASS_BACKGROUND_AFTER_S: the background shader set pass goes on after %lld s (%s)\n",
+                static_cast<long long>(waited.count()), why);
+    std::fflush(stdout);
+}
+} // namespace
+
+void ReleaseBackgroundHold() {
+    {
+        std::scoped_lock lock{hold_mutex};
+        hold_released = true;
+    }
+    hold_wake.notify_all();
+}
+
 void RegisterWorker(const char* name) {
+    // 0840 (T166 review): a thread named here is not a widened before-play thread whose id it may reuse.
 #ifdef PS5_NATIVE
+    ForgetPrepassThread();
     MkwNativeSample::Register(name);
 #endif
     Eden::Crash::NameThread(name);  // a crash report names the thread
@@ -1629,6 +1906,8 @@ void RegisterWorker(const char* name) {
 #ifdef PS5_NATIVE
     PlaceSecondary(name);
 #endif
+    // 0841: the background shader set pass (its first line) waits while the game starts.
+    if (std::strcmp(name, "ShaderSet") == 0) HoldBackgroundPass();
 }
 
 void SampleCpu(unsigned core, unsigned long long thread, unsigned long long pc, unsigned svc, unsigned fpcr) {
@@ -2096,6 +2375,8 @@ extern "C" int eden_jit_commit_scope(int op) {
 // without this the session ended at vkEndCommandBuffer (Ocarina on 13.60, crash-20261108-222452).
 // Any thread, inside the driver: only memory work here, nothing that calls back into Vulkan.
 extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
+// EDEN_UP_HEAP_HOLD_AT_LOAD (headless/heap_arenas.inc): a hold begins or goes on; 1 when it began now.
+extern "C" int eden_heap_hold_begin(void) __attribute__((weak));
 // EDEN_UP_RADV_OOM_LEND=<blocks> (src/guest_memory_service.inc): the reclaim without a list on the heap
 // and without a second scan in the same swap tick when the last found nothing cold, and the guest
 // reserve lent down to that many blocks under its floor. Death at the forest exit (05:37, T120): eleven
@@ -2111,6 +2392,13 @@ extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
     const std::uint64_t lend =
         static_cast<std::uint64_t>(::Common::LiveSwitch::Value<::Common::LiveSwitch::Id::RadvOomLend>());
     const std::uint64_t want = std::clamp<std::uint64_t>(bytes * 4, std::uint64_t{64} << 20, std::uint64_t{512} << 20);
+    // EDEN_UP_HEAP_HOLD_AT_LOAD (heap_arenas.inc): a refused request of 64 MiB or more is an area's big
+    // image, which comes before the texture cache's burst; the heap's pieces stay from here on (the trim
+    // below gives nothing back while the hold runs). run1399: 304,132 KiB refused, the heap's 32 MiB given
+    // here, a 4 MiB heap request refused 1.6 s later (its crash log 975-1015).
+    if (bytes >= (std::uint64_t{64} << 20) && eden_heap_hold_begin && eden_heap_hold_begin() != 0)
+        std::fprintf(stderr, "EDEN_UP_HEAP_HOLD begun: the driver was refused %llu MiB; the heap keeps its pieces\n",
+                     static_cast<unsigned long long>(bytes >> 20));
     std::uint64_t freed = Eden::Performance::TrimHeap("the driver found no memory");
     if (lend != 0 && eden_guest_memory_reclaim_bounded) {
         static const bool verify = Common::PeSwitch("EDEN_UP_RADV_OOM_LEND_VERIFY");
@@ -2155,6 +2443,22 @@ extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
                                                            std::size_t*);
+// How many times the driver found no memory (graphics_refusals; eden_radv_out_of_memory above). Core
+// patch 0940 (EDEN_UP_TC_OOM_SPARE_FRAMES) stops sparing images for 600 frames when it moves. Weak there.
+extern "C" unsigned long long eden_graphics_refusals(void) {
+    return Eden::Performance::graphics_refusals.load(std::memory_order_relaxed);
+}
+// Nonzero while a game write or a pipeline builder's heap request waits for a block (as
+// GuestMemoryWanted above). Core patch 0941 ends EDEN_UP_TC_OOM_SPARE_FRAMES' sparing for 600
+// frames when it reads one: the game's memory comes first. Weak there.
+extern "C" unsigned eden_tc_game_memory_wanted(void) {
+    using Eden::Performance::eden_guest_memory_wanted;
+    using Eden::Performance::eden_heap_wanted;
+    return ((eden_guest_memory_wanted && eden_guest_memory_wanted() != 0) ||
+            (eden_heap_wanted && eden_heap_wanted() != 0))
+               ? 1u
+               : 0u;
+}
 // The largest free block of the pool in bytes, 0 when unknown, looked at again every 20 ms at most:
 // pipeline builds ask it before they start (core patch 0554, waveydude's 0915,
 // EDEN_PIPELINE_MEMORY_GATE_MIB), from any builder thread. Only the kernel query and two atomics:
@@ -2181,3 +2485,5 @@ extern "C" unsigned long long eden_pool_largest_free(void) {
 #endif
 
 #include "ordered_read_trace.inc"
+// EDEN_UP_LOAD_HOLD (T178c, off unless set): the pre-load hold at an area load (core patch 0930).
+#include "load_hold.inc"

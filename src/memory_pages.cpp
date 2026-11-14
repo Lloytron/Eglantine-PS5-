@@ -24,7 +24,14 @@
 #include <vector>
 
 #include "fastmem.h"
+#include "stall_probe.h" // EDEN_UP_STALL_PROBE (guest_memory_service.inc)
+#include "pack_place.h" // 0870 EDEN_GUEST_SWAP_PACK_IN_PLACE=2 (guest_memory_service.inc, PackOut)
 #include "../headless/memory_wait.h" // WaitForBlock's limit (EDEN_GUEST_WRITE_WAIT_MS)
+// 0761 (EDEN_UP_BLOCK_WAIT_TRIM, WaitForBlock): headless/heap_arenas.inc gives the heap's empty
+// spaces back to the pool. Weak: the host checks link without the heap.
+extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
+// EDEN_UP_HEAP_HOLD_AT_LOAD (heap_arenas.inc): the same trim, which a hold does not stop.
+extern "C" std::size_t eden_heap_trim_unheld(void) __attribute__((weak));
 
 // EDEN_UP_* switches (guest_memory_service.inc). The host checks compile this file without the
 // core's include path (tools/check-jit-allocator.py): there, the same rule written out.
@@ -838,6 +845,11 @@ void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept {
     *held = guest_committed.load(std::memory_order_relaxed);
 }
 
+namespace {
+// T178b: a table slot's commit waits for a block before the abort below (guest_memory_service.inc).
+bool TableCommitWait(SparseRange& range, std::size_t slot) noexcept;
+} // namespace
+
 // Failure-only accounting uses stack storage; it must also work when allocation fails.
 static void ReportSparseCommitFailure(const SparseRange& range, std::size_t slot) noexcept {
     const auto begin = range.begin.load(std::memory_order_relaxed);
@@ -869,16 +881,24 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
         }
         return;
     }
-    const std::lock_guard lock{sparse_mutex};
-    if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot], range->guest)) {
-        // Out of memory in the middle of a guest mapping: there is no table to continue with.
-        ReportSparseCommitFailure(*range, slot);
-        Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
-        std::abort();
+    {
+        const std::lock_guard lock{sparse_mutex};
+        if (range->owned[slot].load(std::memory_order_relaxed)) return;
+        if (OwnSlot(begin + slot * SparseSlot, &range->physical[slot], range->guest)) {
+            (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
+            range->owned[slot].store(true, std::memory_order_release);
+            return;
+        }
     }
-    (range->guest ? guest_committed : sparse_committed).fetch_add(SparseSlot, std::memory_order_relaxed);
-    range->owned[slot].store(true, std::memory_order_release);
+    // T178b: no block now. Where T177 ended the app here, the commit waits and tries again, without
+    // sparse_mutex (TableCommitWait, guest_memory_service.inc; EDEN_UP_TABLE_WAIT_MS, 10 s unset, 0: none).
+    // Always there: it only runs where the app used to end.
+    if (TableCommitWait(*range, slot)) return;
+    // Out of memory in the middle of a guest mapping: there is no table to continue with.
+    const std::lock_guard lock{sparse_mutex};
+    ReportSparseCommitFailure(*range, slot);
+    Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
+    std::abort();
 }
 
 // Eden gives back a table page once a guest unmapped all of it, and expects zeroes there

@@ -157,3 +157,67 @@ if(EDEN_PS5_FRAMEGEN)
     # included, so a directory-level definition reaches it.
     add_compile_definitions(EDEN_PS5_FRAMEGEN=1)
 endif()
+
+# EDEN_UP_SHADER_PREP_SOURCE_STAMP (core patch 0596, off by default): the translation id, made at
+# build time from the translator as compiled (tools/gen-translation-id.py, after waveydude's
+# generator). Ninja reruns it when any hashed file changes (its depfile); it rewrites the header
+# only when the id changes. When it cannot account for an input it writes an empty id, and the
+# core keeps today's stamp. Hashes only: nothing of it goes into the app but a 32-hex id.
+set(eden_tid_header "${PORT_BUILD_DIR}/include/video_core/renderer_vulkan/translation_id.h")
+set(eden_tid_context "${PORT_BUILD_DIR}/translation_context.txt")
+set(eden_tid_sirit_imported FALSE)
+set(eden_tid_sirit_location "")
+set(eden_tid_sirit_source "")
+if(YUZU_USE_BUNDLED_SIRIT)
+    # sirit-ci: a prebuilt library; its file bytes stand for its sources.
+    set(eden_tid_sirit_imported TRUE)
+    if(DEFINED CPM_PACKAGE_sirit-ci_SOURCE_DIR)
+        file(GLOB_RECURSE eden_tid_sirit_libs "${CPM_PACKAGE_sirit-ci_SOURCE_DIR}/*.a")
+        list(SORT eden_tid_sirit_libs)
+        list(LENGTH eden_tid_sirit_libs eden_tid_sirit_count)
+        if(eden_tid_sirit_count EQUAL 1)
+            set(eden_tid_sirit_location "${eden_tid_sirit_libs}")
+        endif()
+    endif()
+elseif(DEFINED CPM_PACKAGE_sirit_SOURCE_DIR)
+    set(eden_tid_sirit_source "${CPM_PACKAGE_sirit_SOURCE_DIR}")
+endif()
+set(eden_tid_spirv "")
+if(DEFINED CPM_PACKAGE_SPIRV-Headers_SOURCE_DIR AND
+   IS_DIRECTORY "${CPM_PACKAGE_SPIRV-Headers_SOURCE_DIR}/include")
+    set(eden_tid_spirv "${CPM_PACKAGE_SPIRV-Headers_SOURCE_DIR}/include")
+endif()
+string(TOUPPER "${CMAKE_BUILD_TYPE}" eden_tid_config)
+# file(GENERATE) evaluates the text once per enabled language (C, CXX, ASM). The target options
+# carry $<COMPILE_LANGUAGE:...> parts (-fno-rtti for CXX only, the C,CXX warnings), so the texts
+# differ and the generate step fails ("written multiple times with different content"). CONDITION
+# keeps only the CXX evaluation, the language the translator is compiled in: one write, the same
+# text on every generate of the same tree.
+file(GENERATE OUTPUT "${eden_tid_context}" CONTENT
+"compiler=${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION} ${CMAKE_CXX_COMPILER_TARGET}
+flags=${CMAKE_CXX_FLAGS} | ${CMAKE_CXX_FLAGS_${eden_tid_config}} | ${CMAKE_BUILD_TYPE}
+shader_recompiler_definitions=$<TARGET_PROPERTY:shader_recompiler,COMPILE_DEFINITIONS>
+shader_recompiler_options=$<TARGET_PROPERTY:shader_recompiler,COMPILE_OPTIONS>
+video_core_definitions=$<TARGET_PROPERTY:video_core,COMPILE_DEFINITIONS>
+video_core_options=$<TARGET_PROPERTY:video_core,COMPILE_OPTIONS>
+include_dirs=$<TARGET_PROPERTY:video_core,INCLUDE_DIRECTORIES>
+sirit_source=${eden_tid_sirit_source}
+sirit_imported=${eden_tid_sirit_imported}
+sirit_location=${eden_tid_sirit_location}
+spirv_headers=${eden_tid_spirv}
+driver=${EDEN_VULKAN_DRIVER}
+" CONDITION $<COMPILE_LANGUAGE:CXX>)
+add_custom_command(OUTPUT "${eden_tid_header}"
+    COMMAND python3 "${PORT_ROOT}/tools/gen-translation-id.py"
+        --source "${PROJECT_SOURCE_DIR}" --port-build "${PORT_BUILD_DIR}"
+        --context "${eden_tid_context}" --out "${eden_tid_header}"
+        --depfile "${PORT_BUILD_DIR}/translation_id.d"
+        --inventory "${PORT_BUILD_DIR}/translation_inputs.txt"
+    DEPENDS "${PORT_ROOT}/tools/gen-translation-id.py" "${eden_tid_context}"
+    DEPFILE "${PORT_BUILD_DIR}/translation_id.d"
+    COMMENT "EDEN translation id (EDEN_UP_SHADER_PREP_SOURCE_STAMP)"
+    VERBATIM)
+add_custom_target(eden_translation_id DEPENDS "${eden_tid_header}")
+add_dependencies(video_core eden_translation_id)
+set_property(SOURCE "${PROJECT_SOURCE_DIR}/src/video_core/renderer_vulkan/vk_pipeline_prep.cpp"
+    TARGET_DIRECTORY video_core APPEND PROPERTY OBJECT_DEPENDS "${eden_tid_header}")

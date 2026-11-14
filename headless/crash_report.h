@@ -34,6 +34,13 @@ inline constexpr unsigned kNamedThreads = 192;
 inline NamedThread named_threads[kNamedThreads];
 inline std::atomic<unsigned> named_thread_count{0};
 
+// T175d (main.cpp, EDEN_UP_LOG_FLUSH_MS): what else is written out at a crash (eden_log.txt when its
+// lines are buffered). Null: nothing else. The first set starts a helper thread of its own for it
+// (crash_report.cpp), so a stuck stdout or stderr lock cannot keep it from running, and the
+// restarting helper then waits up to 2 s more for it. Never set: as before.
+inline std::atomic<void (*)()> extra_flush{nullptr};
+void SetExtraFlush(void (*flush)()) noexcept;
+
 inline void NameThread(const char* name) noexcept {
     const auto self = (std::uintptr_t)pthread_self();
     const unsigned count = named_thread_count.load(std::memory_order_relaxed);

@@ -15,6 +15,9 @@
 #include "memory_wait.h"
 // The heap's empty pieces back to the pool (headless/heap_arenas.inc); absent in host tools.
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
+// EDEN_UP_HEAP_HOLD_AT_LOAD (heap_arenas.inc): the same trim, which a hold does not stop (the JIT
+// aborts when its wait finds nothing).
+extern "C" std::size_t eden_heap_trim_unheld(void) __attribute__((weak));
 // EDEN_UP_JIT_COMMIT_RECLAIM=2/3: cold guest memory packed now (src/guest_memory_service.inc; 0 without
 // EDEN_GUEST_SWAP=2/3 and EDEN_GUEST_SWAP_RECLAIM=1); absent in host tools.
 extern "C" std::size_t eden_guest_memory_reclaim_bounded(std::size_t want, int verify) __attribute__((weak));
@@ -140,7 +143,8 @@ inline Xbyak::Allocator* EdenJitAllocator() {
                 return;
             }
             for (int attempt = 1; attempt <= attempts; ++attempt) {
-                if (attempt % 25 == 1 && eden_heap_trim) eden_heap_trim();
+                if (attempt % 25 == 1 && eden_heap_trim)
+                    (void)(eden_heap_trim_unheld ? eden_heap_trim_unheld() : eden_heap_trim());
                 usleep(20000);
                 if (Common::CommitCodeRange(pointer, bytes)) {
                     std::fprintf(stderr, "JIT code cache: memory found after %d ms\n", attempt * 20);
@@ -184,7 +188,7 @@ inline Xbyak::Allocator* EdenJitAllocator() {
             for (int attempt = 1; attempt <= attempts; ++attempt) {
                 bool fresh = false;
                 if (attempt % 25 == 1 && eden_heap_trim) {
-                    const std::size_t given = eden_heap_trim();
+                    const std::size_t given = eden_heap_trim_unheld ? eden_heap_trim_unheld() : eden_heap_trim();
                     trimmed += given;
                     fresh = given != 0;
                 }

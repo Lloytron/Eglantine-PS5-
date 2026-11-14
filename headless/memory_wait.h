@@ -133,6 +133,29 @@ inline bool WorthWaitingFor(std::uint64_t bytes) {
     return bytes <= LargestWaitedRequest;
 }
 
+// EDEN_UP_DOOR_WAIT=1 (0597, our own; headless/main.cpp DoorWait). On a cold first start two
+// pipeline builder jobs take 400-800 MiB of heap within about 2 s, twice, and give it back about 2 s
+// later; a refused operator new on the file-service thread meanwhile gave up after
+// EDEN_UP_NEW_WAIT_MS (2000) and ended the session (v13 run1342: "gave up after 2000 ms (slept
+// 1600 ms)", big_grew=VkPipelineBuild:320). With the switch on, a refusal on an allowed thread
+// (heap_arenas.inc eden_door_may_wait: "FS" and "CPUCore_<n>") while a builder job is in flight, or
+// ended less than DoorRecentMs ago, waits in the handler for up to EDEN_UP_DOOR_WAIT_MAX_MS from its
+// start (one bound for the whole episode, in place of EDEN_UP_NEW_WAIT_MS, also when that is 0):
+// 20 ms steps, each followed by one try of the request; a heap trim at the start, right after a job
+// ended and every TrimEveryMs; eden_heap_want(1) while it waits, so the caches see memory short. It
+// ends served (the try got the memory: the episode closes, so the next wave starts a new one with
+// the whole bound; neither the 60 s same-size rule nor the cooldown applies), timeout (the bound
+// spent: no door waits on this thread for CooldownMs, the request is refused) or jobs-ended (no job
+// for DoorRecentMs and at least EDEN_UP_NEW_WAIT_MS waited: refused). Read once in main after the
+// env files; 0 (off) until then.
+inline std::atomic<unsigned> door_max_ms{0};
+constexpr unsigned DoorDefaultMs = 15'000;
+constexpr unsigned DoorLowMs = 1'000;
+constexpr unsigned DoorHighMs = 30'000;
+constexpr std::uint64_t DoorRecentMs = 500;
+// A refusal within EpisodeGapMs of a served door wait (the try's memory taken before operator new's
+// own try) continues that episode and its bound.
+
 // Number of 20 ms steps in a wait of `ms` (at least one).
 inline unsigned Steps(unsigned ms) {
     return ms < 20 ? 1u : ms / 20u;

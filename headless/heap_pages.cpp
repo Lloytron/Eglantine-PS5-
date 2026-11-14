@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <pthread.h>
 
 #include "common/sparse_large_vector.h"
 
@@ -77,6 +78,16 @@ extern "C" void eden_heap_set_starve_scope(int on) __attribute__((weak));
 //     the pool for 1 s after the pool refused a growth) (headless/heap_arenas.inc, eden_heap_steal).
 //     EDEN_UP_HEAP_STEAL_TABLE=1 adds the heap's table at the brink (read in headless/performance.cpp).
 extern "C" void eden_heap_set_steal(int mode) __attribute__((weak));
+//   EDEN_UP_HEAP_ADOPT_WIDE=<n> (17 to 1024; unset, 0 or 1-16: off): a thread whose own arenas are full
+//     asks up to n arenas no thread is on for room before it makes a new arena, instead of 16
+//     (headless/heap_arenas.inc, eden_heap_adopt; 0880). Line "EDEN_HEAP_ADOPT_WIDE" every 20 s.
+extern "C" void eden_heap_set_adopt_wide(unsigned arenas) __attribute__((weak));
+//   RADV_PS5_LONGLIVED_ARENA=<0|1> (unset: off, as T173): 1, the objects the driver keeps (made inside
+//     its long-lived scopes, lead-mesh-42) take their small blocks from one shared set of arenas, not
+//     from the compile threads' own; 0, count only (no routing; the scopes' requests and bytes are
+//     counted, ll_requests/ll_bytes). Both: "EDEN_HEAP_LONG_LIVED" lines at
+//     the boot's end (before and after a trim) and every 20 s (headless/heap_arenas.inc, T175b).
+extern "C" void eden_heap_set_long_lived(int mode) __attribute__((weak));
 //   EDEN_TEST_HEAP_NO_GROW=<every>[,<after_s>] (a test): from <after_s> s on, every <every>-th growth of
 //     the heap is refused as if the pool had no memory (headless/heap_arenas.inc, eden_heap_test_no_grow).
 extern "C" void eden_heap_set_no_grow(unsigned every, unsigned after_s) __attribute__((weak));
@@ -106,6 +117,58 @@ static bool ParseUpTo3(const char* text, unsigned long* out, unsigned* parts) {
     }
     return false;
 }
+//   EDEN_UP_BIG_STACKS=1 (exact 1; log only; 0593): every heap request of 256 KiB or more by call chain
+//     and thread, printed by its own thread BigStacks, in the crash report and on operator new's
+//     failure lines (headless/heap_arenas.inc, eden_big_*). Tables mapped and the thread made here.
+extern "C" int eden_big_stacks_map(const char** why, int* error) __attribute__((weak));
+extern "C" void eden_big_stacks_unmap(void) __attribute__((weak));
+extern "C" void eden_big_stacks_go(int build_bit) __attribute__((weak));
+extern "C" void eden_big_stacks_run(void) __attribute__((weak));
+namespace Eden::Performance {
+void RegisterWorker(const char* name);
+} // namespace Eden::Performance
+static void* BigStacksMain(void*) {
+    Eden::Performance::RegisterWorker("BigStacks");  // the crash report and the heap's records name it
+    eden_big_stacks_run();                           // never returns
+    return nullptr;
+}
+// A detached thread with its own 256 KiB stack (no global joinable std::thread). Any step that
+// fails: one line, the tables go again, the switch stays off.
+static void StartBigStacks() {
+    if (!eden_big_stacks_map || !eden_big_stacks_unmap || !eden_big_stacks_go || !eden_big_stacks_run) {
+        std::fputs("EDEN_BIG_STACKS off reason=no_heap_hooks error=0 (switch stays off)\n", stderr);
+        return;
+    }
+    const char* why = "map";
+    int error = 0;
+    if (eden_big_stacks_map(&why, &error) != 0) {
+        std::fprintf(stderr, "EDEN_BIG_STACKS off reason=%s error=%d (switch stays off)\n", why, error);
+        return;
+    }
+    pthread_attr_t attributes;
+    int rc = pthread_attr_init(&attributes);
+    if (rc == 0) {
+        rc = pthread_attr_setstacksize(&attributes, std::size_t{256} << 10);
+        if (rc == 0) rc = pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        pthread_t thread;
+        if (rc == 0) rc = pthread_create(&thread, &attributes, BigStacksMain, nullptr);
+        pthread_attr_destroy(&attributes);
+    }
+    if (rc != 0) {
+        eden_big_stacks_unmap();
+        std::fprintf(stderr, "EDEN_BIG_STACKS off reason=thread error=%d (switch stays off)\n", rc);
+        return;
+    }
+    // T136's build scope bit is in the key only when its switch moves the scopes.
+    const char* const burst = std::getenv("EDEN_UP_BUILD_BURST_LOG");
+    eden_big_stacks_go(burst != nullptr && burst[0] == '1' && burst[1] == '\0');
+}
+// EDEN_UP_HEAP_HOLD_AT_LOAD=<s> (1 to 600; unset, 0 or anything else: off) and
+// EDEN_UP_HEAP_HOLD_SPARE_MIB=<32|64|0> (unset: 32): through an area load (the texture cache's
+// AreaEvict window, core 0893) and <s> s after it the heap gives no piece back, and a spare of that
+// many MiB, committed while the pool has room, becomes a space when the pool refuses a growth
+// (headless/heap_arenas.inc, eden_heap_set_hold; t174a). Line "EDEN_UP_HEAP_HOLD" every 10 s.
+extern "C" void eden_heap_set_hold(unsigned seconds, unsigned spare_mib) __attribute__((weak));
 extern "C" void eden_heap_pool_init(void) {
     // EDEN_HEAP_LARGE_MIB=<n> (1 to 32) or EDEN_HEAP_LARGE_KIB=<n> (256 to 32768): requests of that
     // size or more get memory of their own, given back when they are freed
@@ -168,6 +231,23 @@ extern "C" void eden_heap_pool_init(void) {
                      : mode == 2 ? "requests about to be refused are served from arenas no thread is on"
                                  : "requests about to be refused are served from arenas no thread is on, small ones "
                                    "keep the arena, and idle arenas come before the pool while it says no");
+    }
+    if (const char* const wide = std::getenv("EDEN_UP_HEAP_ADOPT_WIDE");
+        wide != nullptr && wide[0] >= '1' && wide[0] <= '9' && eden_heap_set_adopt_wide) {
+        char* end = nullptr;
+        const unsigned long arenas = std::strtoul(wide, &end, 10);
+        if (end != nullptr && *end == '\0' && arenas > 16 && arenas <= 1024) {
+            eden_heap_set_adopt_wide(static_cast<unsigned>(arenas));
+            std::fprintf(stderr, "EDEN_UP_HEAP_ADOPT_WIDE a thread out of arena room asks up to %lu idle arenas "
+                         "before it makes a new one (16 without)\n", arenas);
+        }
+    }
+    if (const char* const ll = std::getenv("RADV_PS5_LONGLIVED_ARENA");
+        ll != nullptr && (ll[0] == '0' || ll[0] == '1') && ll[1] == '\0' && eden_heap_set_long_lived) {
+        eden_heap_set_long_lived(ll[0] - '0');
+        std::fprintf(stderr, "RADV_PS5_LONGLIVED_ARENA=%c %s\n", ll[0],
+                     ll[0] == '1' ? "the driver's kept objects take their blocks from one shared set of arenas"
+                                  : "count only: the driver's kept objects stay in the compile threads' arenas");
     }
     if (const char* const no_grow = std::getenv("EDEN_TEST_HEAP_NO_GROW");
         no_grow != nullptr && no_grow[0] >= '1' && no_grow[0] <= '9' && eden_heap_set_no_grow) {
@@ -235,6 +315,29 @@ extern "C" void eden_heap_pool_init(void) {
     big_image_no_split.store(no_split != nullptr && no_split[0] == '1', std::memory_order_relaxed);
     if (big_image_no_split.load(std::memory_order_relaxed))
         std::fputs("EDEN_BIG_IMAGE_NO_SPLIT a big image's block is refused when the reserve cannot serve it\n", stderr);
+    if (const char* const big = std::getenv("EDEN_UP_BIG_STACKS"); big != nullptr && big[0] == '1' && big[1] == '\0')
+        StartBigStacks();
+    if (const char* const hold = std::getenv("EDEN_UP_HEAP_HOLD_AT_LOAD");
+        hold != nullptr && hold[0] >= '1' && hold[0] <= '9' && eden_heap_set_hold) {
+        char* end = nullptr;
+        const unsigned long seconds = std::strtoul(hold, &end, 10);
+        unsigned long spare = 32;
+        if (const char* const mib = std::getenv("EDEN_UP_HEAP_HOLD_SPARE_MIB"); mib != nullptr) {
+            char* mib_end = nullptr;
+            spare = std::strtoul(mib, &mib_end, 10);
+            if (mib_end == mib || *mib_end != '\0' || (spare != 0 && spare != 32 && spare != 64)) {
+                std::fprintf(stderr, "EDEN_UP_HEAP_HOLD_SPARE_MIB=%s is not 0, 32 or 64: 32\n", mib);
+                spare = 32;
+            }
+        }
+        if (end != nullptr && *end == '\0' && seconds >= 1 && seconds <= 600) {
+            eden_heap_set_hold(static_cast<unsigned>(seconds), static_cast<unsigned>(spare));
+            std::fprintf(stderr, "EDEN_UP_HEAP_HOLD_AT_LOAD the heap gives nothing back through an area load and %lu s "
+                         "after it; a spare of %lu MiB serves a growth the pool refuses\n", seconds, spare);
+        } else {
+            std::fprintf(stderr, "EDEN_UP_HEAP_HOLD_AT_LOAD=%s is not 1 to 600: off\n", hold);
+        }
+    }
 }
 
 // 1: a large block of this size, of the reserve's class, must not be taken in pieces (the request
