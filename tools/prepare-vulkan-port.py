@@ -1359,10 +1359,57 @@ POOL_PRESSURE = r'''    const auto PoolPressure = [this]() -> int {
             }
             const auto free_memory = ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed);
             const u64 free_bytes = free_memory ? free_memory() : ~u64{0};
+            int level = 0;
             if ((refusal_frame != 0 && frame_tick - refusal_frame < 120) || free_bytes < critical_bytes) {
-                return 2;
+                level = 2;
+            } else if (free_bytes < short_bytes) {
+                level = 1;
             }
-            return free_bytes < short_bytes ? 1 : 0;
+            // EDEN_UP_TEX_SHARE=1 (zortos293/Lichii PR #823 by janvitos, 661cf0e, "let an integrated
+            // GPU's memory share bound the textures only"): on a chip whose GPU shares memory with
+            // the CPU, what is not images kept the collector past its marks, so it deleted and remade
+            // images in use (Deck: ~480 a second, camera pan 11 -> 14.5 fps with #948). Here the
+            // images are counted alone already; the pool's shortness (whoever took the pool) is
+            // what still pushes the collector, ~3500 images per 600 frames in the field. With the
+            // switch, the "short" level (largest free block under EDEN_NX2_TC_POOL_SHORT_MIB) leaves
+            // the images alone while they hold under EDEN_UP_TEX_SHARE_MIB; level 2 (a refusal in
+            // the last 120 frames, or under EDEN_NX2_TC_POOL_CRITICAL_MIB) collects as before.
+            // EDEN_UP_TEX_SHARE_MIB unset or 0: no share, the collector as T181 (no more memory).
+            static const bool tex_share = [] {
+                const char* value = std::getenv("EDEN_UP_TEX_SHARE");
+                return value != nullptr && value[0] != '\0' && value[0] != '0';
+            }();
+            if (tex_share) {
+                static const u64 share_bytes = [] {
+                    const char* value = std::getenv("EDEN_UP_TEX_SHARE_MIB");
+                    const u64 bytes = (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL) << 20;
+                    LOG_INFO(HW_GPU, "EDEN_UP_TEX_SHARE: images keep {} MiB through a short pool (level 1); "
+                                     "a refusal or a critical pool collects as before", bytes >> 20);
+                    return bytes;
+                }();
+                static u64 counted_frame = ~u64{0};
+                static u64 logged_frame = 0;
+                static u64 short_frames = 0, waived_frames = 0, critical_frames = 0;
+                const bool waive = level == 1 && total_used_memory < share_bytes;
+                if (counted_frame != frame_tick) {
+                    counted_frame = frame_tick;
+                    short_frames += level == 1 ? 1 : 0;
+                    waived_frames += waive ? 1 : 0;
+                    critical_frames += level == 2 ? 1 : 0;
+                    if (frame_tick - logged_frame >= 600) {
+                        LOG_INFO(HW_GPU, "EDEN_UP_TEX_SHARE last {} frames: share {} MiB, images {} MiB, "
+                                         "collector frames short {} (waived {}), critical {}",
+                                 frame_tick - logged_frame, share_bytes >> 20, total_used_memory >> 20,
+                                 short_frames, waived_frames, critical_frames);
+                        logged_frame = frame_tick;
+                        short_frames = waived_frames = critical_frames = 0;
+                    }
+                }
+                if (waive) {
+                    level = 0;
+                }
+            }
+            return level;
         }
     };
 '''
