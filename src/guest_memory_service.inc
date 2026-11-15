@@ -198,6 +198,23 @@ std::uintptr_t ThreadKey(Id id) noexcept {
 std::atomic<std::uintptr_t> gpu_thread_ids[3]{};
 // EDEN_UP_GPU_READ_THROUGH is on (set as the service starts; the fault handler asks it too, 0901).
 std::atomic<bool> read_through_on{false};
+// 1081: read admission, independent of the session's 0901 fault-lock protection above.
+// One relaxed load per callback: 0 plain reads, 1 unrestricted, 2 admitted in a load window.
+std::atomic<unsigned> read_through_access{0};
+std::atomic<bool> read_through_loads{false}; // publishes the settings below to the already-running keeper
+// Review fix: two pool thresholds. The stay after the big load sits at 12-32 MiB largest free block for
+// minutes (memroom R/RT/RH, 14 Nov), so one 64 MiB open-and-hold threshold never closed. The window opens
+// on the FALL through `open` (armed again only by a reading at or above it), or below `hold`, or a long
+// wait; it stays open only while below `hold` or a long wait goes on.
+std::size_t read_through_load_bytes = std::size_t{256} << 20, read_through_load_hold_bytes = std::size_t{2} << 20;
+unsigned read_through_load_wait_ms = 250, read_through_load_close_ms = 30000;
+std::atomic<unsigned> read_through_load_waiters{0}; // WaitForBlock waits past WAIT_MS
+std::atomic<std::uint64_t> read_through_load_events{0}; // also catches waits that end between keeper ticks
+std::atomic<std::uint64_t> read_through_load_windows{0}, read_through_load_pieces{0};
+std::atomic<std::uint64_t> read_through_load_gpu_in{0}, read_through_load_gpu_out{0}; // GPU waits by window state
+// Keeper-owned while running; initialized before loads is published, closed after the keeper joins.
+std::uint64_t read_through_load_open_ms = 0, read_through_load_quiet_ms = 0, read_through_load_seen = 0;
+bool read_through_load_armed = true;
 int GpuThreadKind() noexcept {
     const std::uintptr_t self = ThreadKey(pthread_self());
     for (int kind = 1; kind <= 2; ++kind)
@@ -242,7 +259,8 @@ bool FaultReserveBlock(std::int64_t* physical) noexcept {
     // EDEN_UP_FAULT_GPU keeps nothing back from the game's CPU threads any more. run1418 (T177 F1): a CPU
     // thread's write fault waited 5,975 ms and died with kept_for_gpu=3203 while taken_gpu stayed 0.
     const bool keep_for_gpu = !gpu && fault_gpu_first.load(std::memory_order_relaxed);
-    const bool waive = keep_for_gpu && read_through_on.load(std::memory_order_relaxed);
+    const bool waive = keep_for_gpu && read_through_on.load(std::memory_order_relaxed) &&
+                       read_through_access.load(std::memory_order_relaxed) != 0;
     const std::size_t keep = keep_for_gpu && !waive ? FaultReserveGpuKeep : 0;
     Spin(fault_reserve_lock);
     std::size_t count = fault_reserve_count.load(std::memory_order_relaxed);
@@ -1841,6 +1859,11 @@ bool WaitForBlock(Promote&& promote, std::size_t slot = 0, std::uint8_t state = 
     // T181a EDEN_UP_WAIT_RECLAIM (at wait_reclaim_on): the mark after AFTER_MS, and past `limit` the wait goes
     // on while a recent round freed memory (bounded by EDEN_UP_WAIT_RECLAIM_MAX_MS). Off: as before.
     const bool reclaim = wait_reclaim_on.load(std::memory_order_relaxed);
+    const bool loads = read_through_loads.load(std::memory_order_acquire);
+    if (loads && gpu_kind != 0) // 1081: was the window open as this GPU wait began (out: late or not needed)
+        (read_through_access.load(std::memory_order_relaxed) == 2 ? read_through_load_gpu_in : read_through_load_gpu_out)
+            .fetch_add(1, std::memory_order_relaxed);
+    bool load_waiter = false;
     ReclaimMark mark;
     bool extended = false;
     for (unsigned tries = 0; !ok; ++tries) {
@@ -1860,8 +1883,14 @@ bool WaitForBlock(Promote&& promote, std::size_t slot = 0, std::uint8_t state = 
         const timespec pause{0, 20'000'000};
         nanosleep(&pause, nullptr);
         ok = promote();
+        if (loads && !ok && !load_waiter && MonotonicMs() - wait_start_ms >= read_through_load_wait_ms) {
+            load_waiter = true;
+            read_through_load_waiters.fetch_add(1, std::memory_order_relaxed);
+            read_through_load_events.fetch_add(1, std::memory_order_relaxed);
+        }
         if (reclaim && !ok) (void)mark.Tick(gpu_kind != 0, FaultThreadName(gpu_kind), slot, wait_start_ms);
     }
+    if (load_waiter) read_through_load_waiters.fetch_sub(1, std::memory_order_relaxed);
     mark.Drop();
     if (extended && ok) reclaim_extended_won.fetch_add(1, std::memory_order_relaxed);
     memory_waiters.fetch_sub(1, std::memory_order_acq_rel);
@@ -2686,6 +2715,7 @@ bool BringBackRead(SparseRange& range, std::size_t slot, const void* source, std
 // The keeper, every 100 ms, after EDEN_UP_FAULT_RESERVE is refilled and before the reserve is (=2 only; otherwise one relaxed load).
 void ServeWantedBack() noexcept {
     if (wanted_pending.load(std::memory_order_relaxed) == 0 || read_through_mode.load(std::memory_order_relaxed) < 2) return; // =2 and =3
+    if (read_through_access.load(std::memory_order_relaxed) == 0) return; // 1081: mode 0 outside loads
     SparseRange* const range = service_range.load(std::memory_order_acquire);
     if (range == nullptr || range->state == nullptr) return;
     auto& b = bring_back_counters;
@@ -2809,7 +2839,8 @@ bool ReadOutLocked(ReadScratch& sc, SparseRange& range, std::size_t slot, std::s
 }
 
 // One slot's part of a read.
-void ReadPiece(SparseRange& range, std::size_t slot, std::size_t offset, std::uint8_t* dest, std::size_t size) noexcept {
+void ReadPiece(SparseRange& range, std::size_t slot, std::size_t offset, std::uint8_t* dest, std::size_t size,
+               bool in_load_window) noexcept {
     const auto* source = reinterpret_cast<const void*>(SlotAddress(range, slot) + offset);
     const std::uint8_t state = range.state[slot].load(std::memory_order_acquire) & SlotMask;
     if (state != SlotOut && state != SlotProbe) { // mapped and readable (a locked one too: as before)
@@ -2832,6 +2863,7 @@ void ReadPiece(SparseRange& range, std::size_t slot, std::size_t offset, std::ui
             if (copied) {
                 c.out_pieces.fetch_add(1, std::memory_order_relaxed);
                 c.out_bytes.fetch_add(size, std::memory_order_relaxed);
+                if (in_load_window) read_through_load_pieces.fetch_add(1, std::memory_order_relaxed);
             } else {
                 c.failures.fetch_add(1, std::memory_order_relaxed);
             }
@@ -2856,12 +2888,15 @@ bool GuestReadThrough(void* dest, const void* source, std::size_t size) {
     const auto from = reinterpret_cast<std::uintptr_t>(source), to = reinterpret_cast<std::uintptr_t>(dest);
     if (begin == 0 || from < begin || from >= end || size > end - from) return false;
     if (to < end && to + size > begin) return false; // into the guest's memory: the copy as before
+    // 1081: one admission check. 0 only in the moment a window closes (the hooks are taken away then): the copy as before.
+    const unsigned access = read_through_access.load(std::memory_order_relaxed);
+    if (access == 0) return false;
     auto* out = static_cast<std::uint8_t*>(dest);
     std::uintptr_t at = from;
     for (std::size_t left = size; left != 0;) {
         const std::size_t slot = (at - begin) / SparseSlot, offset = (at - begin) % SparseSlot;
         const std::size_t piece = std::min(left, SparseSlot - offset);
-        ReadPiece(*range, slot, offset, out, piece);
+        ReadPiece(*range, slot, offset, out, piece, access == 2);
         out += piece;
         at += piece;
         left -= piece;
@@ -2877,6 +2912,8 @@ bool GuestSpanReadable(const void* source, std::size_t size) {
     const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed), end = range->end;
     const auto from = reinterpret_cast<std::uintptr_t>(source);
     if (begin == 0 || from < begin || from >= end || size > end - from) return true;
+    // 1081: as in GuestReadThrough; 0: the direct span, which faults as before if still cold when used.
+    if (read_through_access.load(std::memory_order_relaxed) == 0) return true;
     for (std::size_t slot = (from - begin) / SparseSlot, last = (from + size - 1 - begin) / SparseSlot; slot <= last; ++slot) {
         const std::uint8_t state = range->state[slot].load(std::memory_order_acquire) & SlotMask;
         if (state == SlotOut || state == SlotProbe) {
@@ -2893,6 +2930,63 @@ extern "C" void eden_core_set_guest_read_through(bool (*copy)(void*, const void*
                                                   bool (*readable)(const void*, std::size_t)) __attribute__((weak));
 
 namespace {
+// 1081: keeper transitions only (stop closes after it joins). Never called by a fault handler.
+// Review fix: the core's two hooks are set only while a window is open, so outside one the core makes
+// no call at all (one acquire load of a null pointer, as mode 0). A call already inside a hook when the
+// window closes finishes as read-through (the scratches, locks and slots stay as they are).
+void ReadThroughLoadWindow(bool open, const char* reason, std::uint64_t now_ms, std::size_t largest) noexcept {
+    const std::uint64_t age = open ? 0 : now_ms - read_through_load_open_ms;
+    if (open) {
+        read_through_load_open_ms = now_ms;
+        read_through_load_windows.fetch_add(1, std::memory_order_relaxed);
+        read_through_access.store(2u, std::memory_order_relaxed);
+        eden_core_set_guest_read_through(&GuestReadThrough, &GuestSpanReadable); // non-null: `through` asked for it
+    } else {
+        eden_core_set_guest_read_through(nullptr, nullptr);
+        read_through_access.store(0u, std::memory_order_relaxed);
+    }
+    char line[200];
+    const int length = std::snprintf(line, sizeof(line),
+        "EDEN_UP_GPU_READ_LOADS %s reason=%s t_ms=%llu open_ms=%llu largest_mib=%zu\n", open ? "open" : "close", reason,
+        (unsigned long long)(now_ms - fault_log_start_ms), (unsigned long long)age, largest >> 20);
+    if (length > 0) Report(line);
+}
+#ifdef PS5_NATIVE
+void GpuReadLoadsTick() noexcept {
+    if (!read_through_loads.load(std::memory_order_acquire)) return;
+    // Same query as SwapTick/PoolLargest/BringBackHeadroom, every keeper pass (100 ms) while LOADS is on.
+    std::int64_t start = 0;
+    std::size_t largest = 0;
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    const bool known = total > 0 && sceKernelAvailableDirectMemorySize(0, total, FinePage, &start, &largest) == 0;
+    if (!known) largest = 0; // not known: as empty (opens and holds, reason pool_unknown)
+    if (largest >= read_through_load_bytes) read_through_load_armed = true;
+    const bool fell = read_through_load_armed && largest < read_through_load_bytes; // the fall at a load
+    const bool empty = largest < read_through_load_hold_bytes;                     // no block to bring a slot in
+    const std::uint64_t events = read_through_load_events.load(std::memory_order_relaxed);
+    const bool waited = read_through_load_waiters.load(std::memory_order_relaxed) != 0 || events != read_through_load_seen;
+    read_through_load_seen = events;
+    const std::uint64_t now = MonotonicMs();
+    const bool open = read_through_access.load(std::memory_order_relaxed) == 2;
+    if (!open) {
+        if (fell || empty || waited) {
+            read_through_load_armed = false; // a new fall needs a reading at or above the open threshold first
+            read_through_load_quiet_ms = 0;
+            const char* reason = !known ? "pool_unknown" : empty ? (waited ? "pool_empty+wait" : "pool_empty")
+                                 : fell ? (waited ? "pool_fall+wait" : "pool_fall") : "wait";
+            ReadThroughLoadWindow(true, reason, now, largest);
+        }
+    } else if (empty || waited) {
+        read_through_load_quiet_ms = 0;
+    } else {
+        if (read_through_load_quiet_ms == 0) read_through_load_quiet_ms = now;
+        if (now - read_through_load_quiet_ms >= read_through_load_close_ms) {
+            read_through_load_armed = largest >= read_through_load_bytes;
+            ReadThroughLoadWindow(false, "quiet", now, largest);
+        }
+    }
+}
+#endif
 // As the service starts: EDEN_UP_GPU_READ_THROUGH, EDEN_UP_FAULT_RESERVE, EDEN_UP_FAULT_GPU,
 // EDEN_UP_FAULT_LOG (0900). Unset: nothing set, nothing filled, no line.
 bool GpuReadSwitchesOn() noexcept {
@@ -2900,7 +2994,8 @@ bool GpuReadSwitchesOn() noexcept {
     if (fault_reserve_target.load(std::memory_order_relaxed) != 0 || fault_gpu_first.load(std::memory_order_relaxed))
         return true;
 #endif
-    return read_through_on.load(std::memory_order_relaxed) || fault_log_fd.load(std::memory_order_relaxed) >= 0 ||
+    return read_through_on.load(std::memory_order_relaxed) || read_through_loads.load(std::memory_order_relaxed) ||
+           fault_log_fd.load(std::memory_order_relaxed) >= 0 ||
            fault_last_try.load(std::memory_order_relaxed); // T178b EDEN_UP_FAULT_LAST_TRY=1 alone
 }
 void ReadGpuReadSwitches() noexcept {
@@ -2973,10 +3068,47 @@ void ReadGpuReadSwitches() noexcept {
     }
     wanted_pending.store(0, std::memory_order_relaxed);
 #endif
+    // 1081: only exact =1 enables LOADS, and only with a working read-through mode. Digits only;
+    // invalid/out-of-range tuning values use defaults. No pool queries or new lines when unset.
+    const char* const loads_value = std::getenv("EDEN_UP_GPU_READ_THROUGH_LOADS");
+    const bool loads = through && loads_value != nullptr && loads_value[0] == '1' && loads_value[1] == '\0';
+    const auto setting = [](const char* name, unsigned fallback, unsigned most) noexcept {
+        const char* value = std::getenv(name);
+        if (value == nullptr || *value == '\0') return fallback;
+        unsigned asked = 0;
+        while (*value >= '0' && *value <= '9' && asked <= most) asked = asked * 10 + static_cast<unsigned>(*value++ - '0');
+        return *value == '\0' && asked >= 1 && asked <= most ? asked : fallback;
+    };
+    if (loads) {
+        read_through_load_bytes = std::size_t{setting("EDEN_UP_GPU_READ_THROUGH_LOADS_MIB", 256, 16384)} << 20;
+        read_through_load_hold_bytes = std::size_t{setting("EDEN_UP_GPU_READ_THROUGH_LOADS_HOLD_MIB", 2, 16384)} << 20;
+        if (read_through_load_hold_bytes > read_through_load_bytes) read_through_load_hold_bytes = read_through_load_bytes;
+        read_through_load_wait_ms = setting("EDEN_UP_GPU_READ_THROUGH_LOADS_WAIT_MS", 250, 60000);
+        read_through_load_close_ms = setting("EDEN_UP_GPU_READ_THROUGH_LOADS_CLOSE_S", 30, 600) * 1000;
+    }
+    read_through_load_open_ms = read_through_load_quiet_ms = read_through_load_seen = 0;
+    read_through_load_armed = true;
+    for (auto* counter : {&read_through_load_events, &read_through_load_windows, &read_through_load_pieces,
+                          &read_through_load_gpu_in, &read_through_load_gpu_out})
+        counter->store(0, std::memory_order_relaxed);
+    read_through_load_waiters.store(0, std::memory_order_relaxed);
+    read_through_access.store(through && !loads ? 1u : 0u, std::memory_order_relaxed); // before read_through_on
     read_through_mode.store(through ? asked_mode : 0, std::memory_order_relaxed);
     read_through_on.store(through, std::memory_order_relaxed);
+    // 1081: with LOADS the hooks wait for the first window (the keeper sets them, ReadThroughLoadWindow);
+    // set before LOADS is published, so a window the keeper opens at once is not undone here.
     if (eden_core_set_guest_read_through != nullptr)
-        eden_core_set_guest_read_through(through ? &GuestReadThrough : nullptr, through ? &GuestSpanReadable : nullptr);
+        eden_core_set_guest_read_through(through && !loads ? &GuestReadThrough : nullptr,
+                                         through && !loads ? &GuestSpanReadable : nullptr);
+    read_through_loads.store(loads, std::memory_order_release); // keeper was started before ReadGpuReadSwitches
+    if (loads) {
+        char more[200];
+        const int written = std::snprintf(more, sizeof(more),
+            "EDEN_UP_GPU_READ_LOADS on: open_mib=%zu hold_mib=%zu wait_ms=%u close_s=%u poll_ms=100\n",
+            read_through_load_bytes >> 20, read_through_load_hold_bytes >> 20, read_through_load_wait_ms,
+            read_through_load_close_ms / 1000);
+        if (written > 0) Report(more);
+    }
     // T178b EDEN_UP_FAULT_LAST_TRY (at fault_last_try): =1 on, =0 off, unset: on while read-through is on.
     {
         const char* const last = std::getenv("EDEN_UP_FAULT_LAST_TRY");
@@ -3016,6 +3148,9 @@ void ReadGpuReadSwitches() noexcept {
 }
 // The service stops: the core's reads are plain copies again.
 void StopGpuRead() noexcept {
+    if (read_through_loads.load(std::memory_order_relaxed) && read_through_access.load(std::memory_order_relaxed) == 2)
+        ReadThroughLoadWindow(false, "stop", MonotonicMs(), 0);
+    read_through_access.store(0, std::memory_order_relaxed);
     read_through_on.store(false, std::memory_order_relaxed);
     read_through_mode.store(0, std::memory_order_relaxed); // T177a
     if (eden_core_set_guest_read_through != nullptr) eden_core_set_guest_read_through(nullptr, nullptr);
@@ -3095,6 +3230,17 @@ void GpuReadReport(const char* when) noexcept {
                                                                                                              : length + 1;
     }
     if (length > 0) Report(line);
+    if (read_through_loads.load(std::memory_order_relaxed)) {
+        char loads[240];
+        const int written = std::snprintf(loads, sizeof(loads),
+            "EDEN_UP_GPU_READ_LOADS %s active=%d windows=%llu inside_pieces=%llu gpu_waits_in=%llu gpu_waits_out=%llu\n",
+            when, read_through_access.load(std::memory_order_relaxed) == 2 ? 1 : 0,
+            (unsigned long long)read_through_load_windows.load(std::memory_order_relaxed),
+            (unsigned long long)read_through_load_pieces.load(std::memory_order_relaxed),
+            (unsigned long long)read_through_load_gpu_in.load(std::memory_order_relaxed),
+            (unsigned long long)read_through_load_gpu_out.load(std::memory_order_relaxed));
+        if (written > 0) Report(loads);
+    }
     // T178b: the CPU side's two changes (with read-through on, or EDEN_UP_FAULT_LAST_TRY=1): one more line.
     const auto& t = fault_last_try_counters;
     const bool cpu_side = fault_last_try.load(std::memory_order_relaxed) || read_through_on.load(std::memory_order_relaxed);
@@ -3132,6 +3278,9 @@ void GpuReadTick(std::uint64_t now_ns) noexcept {
              bring_back_counters.fault.load(std::memory_order_relaxed) + bring_back_counters.after_fail.load(std::memory_order_relaxed); // T177a (0 unless =2)
     moved += fault_last_try_counters.tries.load(std::memory_order_relaxed) +
              bring_back_counters.headroom_refused.load(std::memory_order_relaxed); // T178b (0 unless on)
+    moved += read_through_load_windows.load(std::memory_order_relaxed) +
+             read_through_load_pieces.load(std::memory_order_relaxed) + read_through_load_gpu_in.load(std::memory_order_relaxed) +
+             read_through_load_gpu_out.load(std::memory_order_relaxed);
 #ifdef PS5_NATIVE
     moved += fault_reserve_counters.taken.load(std::memory_order_relaxed) +
              fault_reserve_counters.taken_gpu.load(std::memory_order_relaxed) +
@@ -3210,6 +3359,7 @@ void ReserveKeeper() {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
+        GpuReadLoadsTick(); // 1081: before reserve fills or wanted bring-backs; off: one acquire load
         std::size_t blocks = pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed)
                                                                            : reserve_target.load(std::memory_order_relaxed);
         // EDEN_UP_RADV_OOM_LEND: for 2 s after a lend to the driver, no further than that lend's floor;
@@ -5284,6 +5434,7 @@ void ServiceStop(SparseRange& range) noexcept {
     StopStallProbe();
     StopGpuRead(); // 0900: plain copies again before the slots change
     ServiceReport(range, "end");
+    read_through_loads.store(false, std::memory_order_release); // 1081: next keeper must wait for fresh settings
     MeasureFinePages(range);
     DisarmSlots(range);
     service_range.store(nullptr, std::memory_order_release);
